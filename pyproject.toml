@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "collie-demo"
+version = "0.1.0"
+description = "Guarded blue-whale approach demo for the Unitree Go2"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24,<3",
+  "opencv-python-headless>=4.8,<5",
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "pydantic>=2.7,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9", "pytest-asyncio>=0.23,<1"]
+robot = ["cyclonedds==0.10.2"]
+
+[project.scripts]
+collie-demo = "collie_demo.main:main"
+collie-demo-supervised = "collie_demo.supervisor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

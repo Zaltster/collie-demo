@@ -1,0 +1,13 @@
+{
+  "appId": "collie-demo",
+  "version": "0.1.0",
+  "services": {
+    "app": {
+      "context": ".",
+      "entitlements": [
+        {"type": "network", "mode": "host"}
+      ]
+    }
+  }
+}
+
