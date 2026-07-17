@@ -30,7 +30,8 @@
   </div>
   <script>
     const live=document.querySelector('#live'),camera=document.querySelector('#camera'),target=document.querySelector('#target'),command=document.querySelector('#command'),produce=document.querySelector('#produce'),produceMeta=document.querySelector('#produce-meta'),arm=document.querySelector('#arm'),hold=document.querySelector('#hold'),stop=document.querySelector('#stop'),phrase=document.querySelector('#phrase');
-    let timer=null;
+    let holding=false,pulseLoopRunning=false,stopPromise=null;
+    const normalStops=new Set(['motion is not armed','motion is disarmed','forward_budget_complete','blue_whale_not_found','blue_whale_not_stable','blue_whale_stale','frame_geometry_missing','unranged_forward_disabled']);
     async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok){const e=await r.json();throw new Error(e.detail||r.statusText)}return r.json()}
     function renderProduce(state){
       produce.replaceChildren();
@@ -41,10 +42,26 @@
     }
     async function refresh(){try{const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json());live.textContent=s.ok?'CAMERA LIVE':'CAMERA LOST';live.className=`pill ${s.ok?'good':'bad'}`;target.textContent=s.blue_whale?`Blue whale stable ${s.blue_whale.visible_frames} frames · ${Math.round(s.blue_whale.confidence*100)}%`:'Blue whale not detected';target.className=s.blue_whale?'good':'bad';command.textContent=`${s.command.reason} · forward ${s.command.forward_mps.toFixed(2)} m/s · yaw ${s.command.yaw_rps.toFixed(2)} rad/s · ${s.forward_remaining_s.toFixed(1)}s remaining`;renderProduce(s.produce);hold.disabled=!s.armed;camera.src=`/camera.jpg?t=${Date.now()}`}catch(e){live.textContent='APP UNAVAILABLE';live.className='pill bad'}}
     arm.onclick=async()=>{try{await api('/api/arm',{confirmation:phrase.value});await refresh()}catch(e){alert(e.message)}};
-    async function pulse(){try{await api('/api/pulse')}catch(e){endHold();alert(e.message)}}
-    function beginHold(e){e.preventDefault();if(timer)return;pulse();timer=setInterval(pulse,120)}
-    function endHold(){if(timer){clearInterval(timer);timer=null}api('/api/stop').catch(()=>{});refresh()}
-    hold.addEventListener('pointerdown',beginHold);window.addEventListener('pointerup',endHold);window.addEventListener('pointercancel',endHold);window.addEventListener('blur',endHold);stop.onclick=endHold;
+    const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+    async function stopMotion(){
+      if(!stopPromise)stopPromise=api('/api/stop').catch(()=>{}).finally(()=>{stopPromise=null});
+      return stopPromise;
+    }
+    async function pulseLoop(){
+      if(pulseLoopRunning)return;
+      pulseLoopRunning=true;
+      try{
+        while(holding){
+          try{await api('/api/pulse')}
+          catch(e){const expected=!holding||normalStops.has(e.message);holding=false;await stopMotion();if(!expected)alert(e.message);break}
+          if(holding)await delay(40);
+        }
+      }finally{pulseLoopRunning=false;await refresh()}
+    }
+    function beginHold(e){e.preventDefault();if(holding)return;holding=true;pulseLoop()}
+    function endHold(){const shouldStop=holding||pulseLoopRunning;holding=false;if(shouldStop)stopMotion().finally(refresh)}
+    async function emergencyStop(){holding=false;await stopMotion();await refresh()}
+    hold.addEventListener('pointerdown',beginHold);window.addEventListener('pointerup',endHold);window.addEventListener('pointercancel',endHold);window.addEventListener('blur',endHold);stop.onclick=emergencyStop;
     refresh();setInterval(refresh,250);
   </script>
 </body>
