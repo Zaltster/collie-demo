@@ -26,6 +26,9 @@ class ColorWhaleDetector:
         horizontal_start_fraction: float = 0.08,
         horizontal_end_fraction: float = 0.95,
         maximum_center_jump_px: float = 110.0,
+        minimum_aspect_ratio: float = 0.0,
+        maximum_aspect_ratio: float = math.inf,
+        minimum_brightness: float = 125.0,
     ) -> None:
         if color not in {"blue", "yellow"}:
             raise ValueError(f"unsupported whale color: {color}")
@@ -35,6 +38,9 @@ class ColorWhaleDetector:
         self.horizontal_start_fraction = float(horizontal_start_fraction)
         self.horizontal_end_fraction = float(horizontal_end_fraction)
         self.maximum_center_jump_px = float(maximum_center_jump_px)
+        self.minimum_aspect_ratio = float(minimum_aspect_ratio)
+        self.maximum_aspect_ratio = float(maximum_aspect_ratio)
+        self.minimum_brightness = float(minimum_brightness)
         self._last_center: tuple[int, int] | None = None
         self._visible_frames = 0
 
@@ -67,10 +73,14 @@ class ColorWhaleDetector:
         candidates: list[tuple[float, tuple[int, int, int, int], tuple[int, int]]] = []
         for label in range(1, count):
             x, y, box_width, box_height, area = (int(v) for v in stats[label])
+            aspect_ratio = box_width / max(box_height, 1)
             if not (
                 35 <= area <= 8_000
                 and 7 <= box_width <= 180
                 and 5 <= box_height <= 150
+                and self.minimum_aspect_ratio
+                <= aspect_ratio
+                <= self.maximum_aspect_ratio
             ):
                 continue
             cx, cy = (int(round(v)) for v in centroids[label])
@@ -138,7 +148,9 @@ class ColorWhaleDetector:
         brightness: np.ndarray,
     ) -> np.ndarray:
         if self.color == "blue":
-            return (color_score >= self.minimum_color_score) & (brightness >= 125.0)
+            return (color_score >= self.minimum_color_score) & (
+                brightness >= self.minimum_brightness
+            )
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         hue, saturation, value = cv2.split(hsv)
         return (
@@ -146,7 +158,7 @@ class ColorWhaleDetector:
             & (hue >= 10)
             & (hue <= 38)
             & (saturation >= 50)
-            & (value >= 140)
+            & (value >= self.minimum_brightness)
         )
 
 
@@ -157,7 +169,15 @@ class BlueWhaleDetector(ColorWhaleDetector):
 
 class YellowWhaleDetector(ColorWhaleDetector):
     def __init__(self, **kwargs: object) -> None:
-        super().__init__(color="yellow", minimum_color_score=18.0, **kwargs)
+        defaults: dict[str, object] = {
+            "floor_start_fraction": 0.72,
+            "maximum_aspect_ratio": 3.2,
+            "minimum_aspect_ratio": 1.1,
+            "minimum_brightness": 190.0,
+            "minimum_color_score": 18.0,
+        }
+        defaults.update(kwargs)
+        super().__init__(color="yellow", **defaults)
 
 
 def annotate(frame: CameraFrame, target: BlueWhaleObservation | None) -> bytes:

@@ -19,3 +19,11 @@ def test_target_controls_support_buttons_typed_phrases_and_speech() -> None:
     assert "choose the blue" in html
     assert "await api('/api/target',{color})" in html
     assert "window.SpeechRecognition||window.webkitSpeechRecognition" in html
+
+
+def test_camera_refresh_does_not_cancel_an_inflight_image() -> None:
+    html = (Path(__file__).parents[1] / "web" / "index.html").read_text()
+
+    assert "if(refreshInFlight)return" in html
+    assert "if(camera.complete)camera.src=" in html
+    assert "finally{refreshInFlight=false}" in html

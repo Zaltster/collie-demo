@@ -55,6 +55,18 @@ def test_yellow_detector_ignores_blue_whale() -> None:
     assert YellowWhaleDetector().detect(whale_frame()) is None
 
 
+def test_yellow_detector_prefers_bright_floor_whale_over_dull_warm_patch() -> None:
+    image = np.full((1080, 1920, 3), (80, 96, 119), dtype=np.uint8)
+    cv2.rectangle(image, (1666, 772), (1823, 798), (135, 157, 168), -1)
+    cv2.ellipse(image, (1140, 880), (38, 25), 0, 0, 360, (186, 233, 230), -1)
+
+    target = YellowWhaleDetector().detect(CameraFrame(1, 1.0, image))
+
+    assert target is not None
+    assert abs(target.center[0] - 1140) < 8
+    assert abs(target.center[1] - 880) < 8
+
+
 def test_detects_blue_whale_on_left_side_of_floor() -> None:
     image = np.full((720, 1280, 3), 235, dtype=np.uint8)
     cv2.ellipse(image, (275, 555), (30, 34), 0, 0, 360, (245, 245, 160), -1)
