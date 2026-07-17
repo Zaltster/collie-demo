@@ -22,7 +22,7 @@ class CameraFrame:
 
 
 @dataclass(frozen=True, slots=True)
-class BlueWhaleObservation:
+class TargetObservation:
     frame_id: int
     captured_monotonic_s: float
     bbox_xywh: tuple[int, int, int, int]
@@ -33,7 +33,6 @@ class BlueWhaleObservation:
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
-
 @dataclass(frozen=True, slots=True)
 class VelocityCommand:
     forward_mps: float = 0.0
@@ -42,4 +41,3 @@ class VelocityCommand:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
-

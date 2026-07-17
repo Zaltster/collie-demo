@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from collie_demo.controller import ApproachController
-from collie_demo.types import BlueWhaleObservation
+from collie_demo.types import TargetObservation
 
 
-def target(*, x: int = 640, stable: int = 12, captured: float = 10.0) -> BlueWhaleObservation:
-    return BlueWhaleObservation(1, captured, (x - 20, 620, 40, 60), (x, 650), 0.9, stable)
+def target(*, x: int = 640, stable: int = 12, captured: float = 10.0) -> TargetObservation:
+    return TargetObservation(1, captured, (x - 20, 620, 40, 60), (x, 650), 0.9, stable)
 
 
 def test_missing_target_is_zero() -> None:

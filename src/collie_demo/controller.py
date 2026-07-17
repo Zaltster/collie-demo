@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
-from .types import BlueWhaleObservation, VelocityCommand
+from .types import TargetObservation, VelocityCommand
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,7 +27,7 @@ class ApproachController:
 
     def plan(
         self,
-        target: BlueWhaleObservation | None,
+        target: TargetObservation | None,
         *,
         frame_width: int | None,
         now_monotonic_s: float,

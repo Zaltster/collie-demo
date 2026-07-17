@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
-from .types import BlueWhaleObservation
+from .types import TargetObservation
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +125,7 @@ def annotate_fruits(
 def annotate_selected_produce(
     bgr: NDArray[np.uint8],
     label: str | None,
-    target: BlueWhaleObservation | None,
+    target: TargetObservation | None,
 ) -> NDArray[np.uint8]:
     if label is None or target is None:
         return bgr

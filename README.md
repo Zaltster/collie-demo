@@ -1,8 +1,8 @@
 # Collie Demo
 
-A self-contained Wendy app for Woof with guarded blue/yellow-whale, apple, and
-banana selection and approach plus the SnapStock YOLOv8m fruit and vegetable
-detector.
+A self-contained Wendy app for Woof that lets an operator select any locally
+detected fruit and safely follow that exact object. It uses the SnapStock
+YOLOv8m fruit and vegetable detector.
 Frames come directly from Unitree's public `VideoClient`; inference,
 annotation, motion supervision, and the browser UI all run locally in the
 robot container. No Roboflow service, hosted inference API, Hugging Face key,
@@ -16,15 +16,14 @@ or internet connection is used at runtime.
 - Prints every detection to the container log.
 - Serves the annotated Go2 camera and structured detections on port 8096.
 - Uses a 50% confidence threshold by default.
-- Independently tracks the blue and yellow whale color targets at the original
-  camera-loop rate.
-- Selects a whale, apple, or banana with UI buttons or phrases such as
-  `choose the blue`, `choose the yellow`, `choose the apple`, and
-  `choose the banana`. The browser exposes speech recognition when its
-  security and microphone settings permit it; the typed command always works.
-- Uses YOLO to recognize apple or banana, then follows only the selected
-  produce box with a fast camera-loop MIL tracker so motion never steers from
-  the several-seconds-old inference frame.
+- Adds a `Follow` button to every live detection. The button sends both the
+  model class and bounding-box center, so either of two visible apples can be
+  selected independently.
+- Uses YOLO to recognize the selected fruit, then follows only that exact box
+  with a fast camera-loop MIL tracker so motion never steers from the
+  several-seconds-old inference frame.
+- Keeps the tracker's latest center as the reacquisition hint when another YOLO
+  result arrives.
 - Continuously steers from the latest observation of the selected object.
 - Disarms whenever the selected object changes, so changing targets cannot
   redirect an active motion burst.
@@ -33,8 +32,8 @@ or internet connection is used at runtime.
 - Keeps the exact arm confirmation, press-and-hold control, factory avoidance,
   forward time budget, target-loss stop, and `StopMove` safety boundary.
 
-Only blue whale, yellow whale, apple, and banana are selectable motion targets.
-All other produce detections remain informational.
+Every class emitted by the local model is selectable from the detection list.
+Whale color detection and whale motion targets have been removed.
 
 ## Model
 
@@ -93,6 +92,6 @@ wendy --device woof.local device ps --json
 curl http://woof.local:8096/api/status
 ```
 
-Then open `http://woof.local:8096/`. A healthy status response must report
-the SnapStock model path, all 63 classes under `produce`, fresh blue and yellow
-whale observations, the selected target, motion state, and `ok: true`.
+Then open `http://woof.local:8096/`. A healthy status response must report the
+SnapStock model path, all 63 classes under `produce`, the selected fruit and
+its current tracker observation, motion state, and `ok: true`.

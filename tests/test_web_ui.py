@@ -10,19 +10,16 @@ def test_hold_control_serializes_motion_pulses() -> None:
     assert "await api('/api/pulse')" in html
 
 
-def test_target_controls_support_buttons_typed_phrases_and_speech() -> None:
+def test_each_detection_gets_an_exact_follow_control() -> None:
     html = (Path(__file__).parents[1] / "web" / "index.html").read_text()
 
-    assert "Blue whale" in html
-    assert "Yellow whale" in html
-    assert "Apple" in html
-    assert "Banana" in html
-    assert "choose the yellow" in html
-    assert "choose the blue" in html
-    assert "choose the apple" in html
-    assert "choose the banana" in html
-    assert "await api('/api/target',{color:name})" in html
-    assert "window.SpeechRecognition||window.webkitSpeechRecognition" in html
+    assert "for(const [index,item] of state.detections.entries())" in html
+    assert "follow.onclick=()=>chooseTarget(item.label,item.center)" in html
+    assert "await api('/api/target',{target:name,center})" in html
+    assert "closestSelectedIndex" in html
+    assert "Blue whale" not in html
+    assert "Yellow whale" not in html
+    assert "SpeechRecognition" not in html
 
 
 def test_camera_refresh_does_not_cancel_an_inflight_image() -> None:

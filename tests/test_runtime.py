@@ -4,11 +4,9 @@ import asyncio
 from pathlib import Path
 import time
 
-import cv2
 import numpy as np
 
 from collie_demo.controller import ApproachController
-from collie_demo.detector import BlueWhaleDetector
 from collie_demo.fruit import FruitDetection
 from collie_demo.motion import UnitreeMotionAdapter
 from collie_demo.runtime import ARM_CONFIRMATION, CollieRuntime, RuntimeCommandError
@@ -17,22 +15,20 @@ from collie_demo.types import CameraFrame
 from test_motion import FakeAvoidance, FakeSport
 
 
-class CenteredWhaleCamera:
+class StaticFruitCamera:
     def __init__(self) -> None:
         self.frame_id = 0
 
     def read(self) -> CameraFrame:
         self.frame_id += 1
-        image = np.full((720, 1280, 3), 235, dtype=np.uint8)
-        cv2.ellipse(image, (640, 650), (34, 42), 0, 0, 360, (245, 245, 160), -1)
-        cv2.ellipse(image, (900, 650), (52, 34), 0, 0, 360, (70, 220, 235), -1)
+        image = np.full((720, 1280, 3), 120, dtype=np.uint8)
         return CameraFrame(self.frame_id, time.monotonic(), image)
 
 
 class FakeProduceDetector:
     model_path = Path("/models/snapstock.pt")
     confidence = 0.5
-    names = {1: "apple", 6: "banana"}
+    names = {1: "apple", 6: "banana", 30: "Strawberry", 57: "strawberry"}
 
     def detect(self, _image: object) -> list[FruitDetection]:
         return [
@@ -47,8 +43,22 @@ class FakeProduceDetector:
                 class_id=6,
                 label="banana",
                 confidence=0.88,
+                bbox_xyxy=(300, 200, 400, 280),
+                center=(350, 240),
+            ),
+            FruitDetection(
+                class_id=1,
+                label="apple",
+                confidence=0.82,
                 bbox_xyxy=(960, 200, 1060, 280),
                 center=(1010, 240),
+            ),
+            FruitDetection(
+                class_id=30,
+                label="Strawberry",
+                confidence=0.77,
+                bbox_xyxy=(560, 200, 660, 280),
+                center=(610, 240),
             ),
         ]
 
@@ -74,8 +84,7 @@ def test_runtime_requires_confirmation_then_pulses_forward() -> None:
         avoidance = FakeAvoidance()
         motion = UnitreeMotionAdapter(FakeSport(), avoidance)
         runtime = CollieRuntime(
-            camera=CenteredWhaleCamera(),
-            detector=BlueWhaleDetector(),
+            camera=StaticFruitCamera(),
             controller=ApproachController(),
             motion=motion,
             motion_enabled=True,
@@ -93,48 +102,39 @@ def test_runtime_requires_confirmation_then_pulses_forward() -> None:
                 pass
             else:
                 raise AssertionError("wrong confirmation unexpectedly armed motion")
-            await runtime.arm(ARM_CONFIRMATION)
-            status = await runtime.pulse()
-            assert status["armed"] is True
-            assert status["command"]["reason"] == "supervised_forward_burst"
-            assert avoidance.moves[-1] == (0.08, 0.0, 0.0)
+            try:
+                await runtime.arm(ARM_CONFIRMATION)
+            except RuntimeCommandError:
+                pass
+            else:
+                raise AssertionError("motion armed without a selected fruit")
+            status = await runtime.status()
             assert status["produce"]["detections"][0]["label"] == "apple"
             assert status["produce"]["inference_ms"] is not None
-            assert status["selected_target_name"] == "blue"
-            assert status["whales"]["blue"] is not None
-            assert status["whales"]["yellow"] is not None
+            assert status["selected_target_name"] is None
 
-            selected = await runtime.select_target("yellow")
-            assert selected["selected_target_name"] == "yellow"
-            assert selected["selected_whale"] is not None
-            assert selected["armed"] is False
-            assert selected["command"]["reason"] == "yellow_selected"
-
-            await runtime.arm(ARM_CONFIRMATION)
-            yellow_status = await runtime.pulse()
-            assert yellow_status["armed"] is True
-            assert yellow_status["command"]["reason"] == "curving_to_selected_target"
-            assert avoidance.moves[-1][0] == 0.08
-            assert avoidance.moves[-1][2] < 0.0
-
-            apple = await runtime.select_target("apple")
+            apple = await runtime.select_target("apple", (1010, 240))
             assert apple["selected_target_name"] == "apple"
             assert apple["selected_target_kind"] == "produce"
+            assert apple["selected_target_hint"] == (1010, 240)
             assert apple["armed"] is False
             await asyncio.sleep(0.18)
             await runtime.arm(ARM_CONFIRMATION)
             apple_status = await runtime.pulse()
             assert apple_status["command"]["reason"] == "curving_to_selected_target"
-            assert avoidance.moves[-1][2] > 0.0
+            assert avoidance.moves[-1][2] < 0.0
 
-            banana = await runtime.select_target("banana")
+            banana = await runtime.select_target("banana", (350, 240))
             assert banana["selected_target_name"] == "banana"
             assert banana["armed"] is False
             await asyncio.sleep(0.18)
             await runtime.arm(ARM_CONFIRMATION)
             banana_status = await runtime.pulse()
             assert banana_status["command"]["reason"] == "curving_to_selected_target"
-            assert avoidance.moves[-1][2] < 0.0
+            assert avoidance.moves[-1][2] > 0.0
+
+            strawberry = await runtime.select_target("Strawberry", (610, 240))
+            assert strawberry["selected_target_name"] == "Strawberry"
 
             try:
                 await runtime.select_target("purple")
