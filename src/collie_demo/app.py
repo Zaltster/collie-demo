@@ -54,6 +54,13 @@ def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
         except RuntimeCommandError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/follow")
+    async def follow(request: ArmRequest) -> dict[str, object]:
+        try:
+            return await runtime.start_follow(request.confirmation)
+        except RuntimeCommandError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post("/api/target")
     async def target(request: TargetRequest) -> dict[str, object]:
         try:

@@ -33,6 +33,7 @@ def build_runtime() -> CollieRuntime:
     )
     initialize_dds(network_interface)
     controller_config = ApproachConfig(
+        stable_frames_required=int(os.environ.get("COLLIE_STABLE_FRAMES", "3")),
         forward_mps=float(os.environ.get("COLLIE_FORWARD_MPS", "0.08")),
         forward_budget_s=float(os.environ.get("COLLIE_FORWARD_BUDGET_S", "1.5")),
     )
@@ -56,6 +57,16 @@ def build_runtime() -> CollieRuntime:
             produce_model,
             confidence=float(os.environ.get("COLLIE_PRODUCE_CONFIDENCE", "0.5")),
             device=os.environ.get("COLLIE_INFERENCE_DEVICE", "").strip() or None,
+        ),
+        produce_revalidation_misses_required=int(
+            os.environ.get("COLLIE_REVALIDATION_MISSES", "3")
+        ),
+        maximum_produce_age_s=float(
+            os.environ.get("COLLIE_MAX_PRODUCE_AGE_S", "0.75")
+        ),
+        follow_period_s=float(os.environ.get("COLLIE_FOLLOW_PERIOD_S", "0.05")),
+        follow_start_timeout_s=float(
+            os.environ.get("COLLIE_FOLLOW_START_TIMEOUT_S", "1.5")
         ),
     )
 

@@ -28,6 +28,13 @@ class FakeRuntime:
         self.center = center
         return await self.status()
 
+    async def start_follow(self, confirmation: str) -> dict[str, object]:
+        return {
+            "selected_target_name": self.selected,
+            "confirmation": confirmation,
+            "follow_active": True,
+        }
+
 
 def test_target_endpoint_selects_a_specific_detection(tmp_path: Path) -> None:
     (tmp_path / "index.html").write_text("ok")
@@ -45,3 +52,9 @@ def test_target_endpoint_selects_a_specific_detection(tmp_path: Path) -> None:
         assert client.post(
             "/api/target", json={"target": "banana", "center": [1]}
         ).status_code == 422
+
+        follow = client.post(
+            "/api/follow", json={"confirmation": "TARGET AND PATH CLEAR"}
+        )
+        assert follow.status_code == 200
+        assert follow.json()["follow_active"] is True

@@ -36,6 +36,7 @@
       <b>Selected fruit</b>
       <div id="target" class="bad">Choose a detection</div>
       <div id="command" class="muted">motion zero</div>
+      <div id="monitor" class="muted">Waiting for stage-health telemetry</div>
     </section>
     <section class="panel">
       <b>2. Follow with one click</b>
@@ -45,9 +46,8 @@
     </section>
   </div>
   <script>
-    const live=document.querySelector('#live'),camera=document.querySelector('#camera'),target=document.querySelector('#target'),command=document.querySelector('#command'),produce=document.querySelector('#produce'),produceMeta=document.querySelector('#produce-meta'),targetFeedback=document.querySelector('#target-feedback'),follow=document.querySelector('#follow'),stop=document.querySelector('#stop');
-    let following=false,startingFollow=false,pulseLoopRunning=false,refreshInFlight=false,stopPromise=null;
-    const normalStops=new Set(['motion is not armed','motion is disarmed','forward_budget_complete','selected_target_not_found','selected_target_not_stable','selected_target_stale','selected_target_not_revalidated','frame_geometry_missing','unranged_forward_disabled']);
+    const live=document.querySelector('#live'),camera=document.querySelector('#camera'),target=document.querySelector('#target'),command=document.querySelector('#command'),monitor=document.querySelector('#monitor'),produce=document.querySelector('#produce'),produceMeta=document.querySelector('#produce-meta'),targetFeedback=document.querySelector('#target-feedback'),follow=document.querySelector('#follow'),stop=document.querySelector('#stop');
+    let following=false,startingFollow=false,refreshInFlight=false,stopPromise=null;
     async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok){const e=await r.json();throw new Error(e.detail||r.statusText)}return r.json()}
     function closestSelectedIndex(detections,name,hint){
       if(!name||!hint)return -1;
@@ -65,7 +65,8 @@
         row.className=`detection${isSelected?' selected':''}`;info.className='detection-info';score.className='confidence';score.textContent=`${item.label} · ${(item.confidence*100).toFixed(1)}%`;details.className='muted';details.textContent=`center (${item.center[0]}, ${item.center[1]}) · box (${item.bbox_xyxy.join(', ')})`;choose.className=`choose${isSelected?' selected':''}`;choose.textContent=isSelected?'Selected':'Select';choose.onclick=()=>chooseTarget(item.label,item.center);info.append(score,details);row.append(info,choose);produce.append(row)
       }
       const classCount=Object.keys(state.classes||{}).length;
-      produceMeta.textContent=`${classCount} model classes · threshold ${(state.confidence_threshold*100).toFixed(0)}% · inference ${state.inference_ms??'—'} ms · age ${state.age_s??'—'} s`;
+      const device=state.device||{},fps=state.inference_ms?`${(1000/state.inference_ms).toFixed(1)} FPS`:'— FPS';
+      produceMeta.textContent=`${classCount} classes · ${device.resolved||'unknown device'} · ${fps} · inference ${state.inference_ms??'—'} ms · age ${state.age_s??'—'} s`;
     }
     function seenLabel(observation){
       if(!observation)return 'not tracked';
@@ -79,11 +80,14 @@
       if(refreshInFlight)return;refreshInFlight=true;
       try{
         const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json()),selected=s.selected_target_name,selectedObservation=s.selected_target;
-        live.textContent=s.ok?'CAMERA LIVE':'CAMERA LOST';live.className=`pill ${s.ok?'good':'bad'}`;
+        const failedHealth=Object.entries(s.health||{}).filter(([,ok])=>!ok).map(([name])=>name.replaceAll('_',' '));
+        live.textContent=s.stage_ready?'STAGE READY':`NOT READY${failedHealth.length?`: ${failedHealth.join(', ')}`:''}`;live.className=`pill ${s.stage_ready?'good':'bad'}`;
         target.textContent=selected?`${selected} · ${seenLabel(selectedObservation)}`:'Choose a detected fruit';target.className=selectedObservation?'good':'bad';
         command.textContent=`${s.command.reason} · forward ${s.command.forward_mps.toFixed(2)} m/s · yaw ${s.command.yaw_rps.toFixed(2)} rad/s · ${s.forward_remaining_s.toFixed(1)}s remaining`;
-        if(following&&!s.armed)following=false;
-        renderProduce(s.produce,selected,s.selected_target_hint);updateFollowButton(Boolean(selectedObservation));
+        following=Boolean(s.follow_active);
+        const tracker=s.produce?.tracker,misses=tracker?.revalidation_failures??0,required=tracker?.revalidation_failures_required??3,verified=tracker?.last_verified_age_s;
+        monitor.textContent=`camera ${s.frame_age_s??'—'}s · YOLO verified ${verified??'—'}s ago · misses ${misses}/${required} · motion ${s.motion?.fault||((s.health?.motion_ready)?'ready':'not ready')}`;
+        renderProduce(s.produce,selected,s.selected_target_hint);updateFollowButton(Boolean(s.can_follow));
         if(camera.complete)camera.src=`/camera.jpg?t=${Date.now()}`
       }catch(e){live.textContent='APP UNAVAILABLE';live.className='pill bad'}finally{refreshInFlight=false}
     }
@@ -92,20 +96,14 @@
       try{await api('/api/target',{target:name,center});targetFeedback.textContent=`${name} selected. Click Follow Selected Fruit once to approach.`;await refresh()}
       catch(e){targetFeedback.textContent=e.message}
     }
-    const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
     async function stopMotion(){if(!stopPromise)stopPromise=api('/api/stop').catch(()=>{}).finally(()=>{stopPromise=null});return stopPromise}
-    async function pulseLoop(){
-      if(pulseLoopRunning)return;pulseLoopRunning=true;
-      try{while(following){try{await api('/api/pulse')}catch(e){const expected=!following||normalStops.has(e.message);following=false;if(!expected){await stopMotion();alert(e.message)}else{targetFeedback.textContent=`Approach stopped: ${e.message.replaceAll('_',' ')}`};break}if(following)await delay(40)}}
-      finally{pulseLoopRunning=false;updateFollowButton(Boolean(target.textContent&&target.textContent!=='Choose a detected fruit'));await refresh()}
-    }
     async function beginFollow(){
       if(following||startingFollow)return;startingFollow=true;updateFollowButton(true);
-      try{await api('/api/arm',{confirmation:'TARGET AND PATH CLEAR'});following=true;targetFeedback.textContent='Following selected fruit. Press Stop Now to stop early.';pulseLoop()}
-      catch(e){targetFeedback.textContent=e.message;alert(e.message)}
-      finally{startingFollow=false;updateFollowButton(Boolean(target.textContent&&target.textContent!=='Choose a detected fruit'))}
+      try{const s=await api('/api/follow',{confirmation:'TARGET AND PATH CLEAR'});following=Boolean(s.follow_active);targetFeedback.textContent='Robot-side follow is active. Press Stop Now to stop early.'}
+      catch(e){if(startingFollow){targetFeedback.textContent=e.message;alert(e.message)}}
+      finally{startingFollow=false;await refresh()}
     }
-    function endFollow(){const shouldStop=following||startingFollow||pulseLoopRunning;following=false;startingFollow=false;if(shouldStop)stopMotion().finally(refresh)}
+    function endFollow(){const shouldStop=following||startingFollow;following=false;startingFollow=false;if(shouldStop)fetch('/api/stop',{method:'POST',keepalive:true}).catch(()=>{})}
     async function emergencyStop(){following=false;startingFollow=false;await stopMotion();targetFeedback.textContent='Stopped.';await refresh()}
     follow.onclick=beginFollow;window.addEventListener('pagehide',endFollow);stop.onclick=emergencyStop;
     refresh();setInterval(refresh,250);

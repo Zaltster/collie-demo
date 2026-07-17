@@ -26,11 +26,19 @@ or internet connection is used at runtime.
 - Keeps the tracker's latest center as the reacquisition hint when another YOLO
   result arrives.
 - Revalidates the selected track against every new YOLO result. If the chosen
-  fruit disappears or the tracker drifts to a different object, selection is
-  cleared and motion is stopped instead of displaying a stale target.
+  fruit disappears or the tracker drifts to a different object for three
+  consecutive results, selection is cleared and motion is stopped. One or two
+  transient misses do not interrupt the approach.
 - Marks tracker-only frames honestly in the UI instead of repeating an old
   YOLO confidence score as though it were current.
 - Continuously steers from the latest observation of the selected object.
+- Runs the follow pulse loop inside the robot service after one Follow click;
+  browser timer throttling or a slow status refresh cannot interrupt command
+  renewal. The independent 350 ms motion watchdog remains the final brake.
+- Waits briefly for a freshly selected target to become stable and freshly
+  YOLO-verified, so the operator does not need to click Follow twice.
+- Rejects detections older than 750 ms and clears stale detector output on
+  inference errors.
 - Disarms whenever the selected object changes, so changing targets cannot
   redirect an active motion burst.
 - Runs produce inference in a separate worker so a slow YOLO frame cannot
@@ -40,6 +48,10 @@ or internet connection is used at runtime.
 - Uses Woof's Jetson GPU for YOLO inference and reports the requested/resolved
   device, CUDA version, Torch version, and current inference latency in
   `/api/status`.
+- Reports aggregate `stage_ready` health for the camera, YOLO worker, CUDA GPU,
+  and motion adapter. The UI displays verification age and the current miss
+  count, and the out-of-process supervisor brakes/restarts if readiness remains
+  unhealthy.
 
 Every class emitted by the local model is selectable from the detection list.
 Whale color detection and whale motion targets have been removed.
@@ -105,3 +117,8 @@ Then open `http://woof.local:8096/`. A healthy status response must report the
 SnapStock model path, all 63 classes under `produce`, the selected fruit and
 its current tracker observation, `produce.device.resolved: "cuda:0"`, motion
 state, and `ok: true`.
+
+The stage control sequence is: click `Select` beside the exact fruit, wait for
+the Follow button to enable, then click `Follow Selected Fruit` once. `STOP
+NOW` remains available throughout motion. Do not run the demo unless the header
+shows `STAGE READY`.

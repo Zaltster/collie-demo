@@ -64,6 +64,10 @@ class CollieRuntime:
         produce_tracker_factory: ProduceTrackerFactory | None = None,
         loop_hz: float = 8.0,
         produce_revalidation_iou: float = 0.15,
+        produce_revalidation_misses_required: int = 3,
+        maximum_produce_age_s: float = 0.75,
+        follow_period_s: float = 0.05,
+        follow_start_timeout_s: float = 1.5,
     ) -> None:
         self.camera = camera
         self.controller = controller
@@ -78,6 +82,20 @@ class CollieRuntime:
         if not 0.0 <= produce_revalidation_iou <= 1.0:
             raise ValueError("produce_revalidation_iou must be between 0 and 1")
         self.produce_revalidation_iou = float(produce_revalidation_iou)
+        if produce_revalidation_misses_required < 1:
+            raise ValueError("produce_revalidation_misses_required must be positive")
+        self.produce_revalidation_misses_required = int(
+            produce_revalidation_misses_required
+        )
+        if maximum_produce_age_s <= 0.0:
+            raise ValueError("maximum_produce_age_s must be positive")
+        self.maximum_produce_age_s = float(maximum_produce_age_s)
+        if follow_period_s <= 0.0:
+            raise ValueError("follow_period_s must be positive")
+        self.follow_period_s = float(follow_period_s)
+        if follow_start_timeout_s <= 0.0:
+            raise ValueError("follow_start_timeout_s must be positive")
+        self.follow_start_timeout_s = float(follow_start_timeout_s)
         self._state_lock = asyncio.Lock()
         self._action_lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
@@ -92,6 +110,7 @@ class CollieRuntime:
         self._produce_tracker_label: str | None = None
         self._produce_visible_frames = 0
         self._produce_verified_at: float | None = None
+        self._produce_revalidation_failures = 0
         self._produce_detections: list[FruitDetection] = []
         self._produce_frame_id: int | None = None
         self._produce_last_at: float | None = None
@@ -105,6 +124,8 @@ class CollieRuntime:
         self._last_pulse_at: float | None = None
         self._forward_elapsed_s = 0.0
         self._command = VelocityCommand(reason="disarmed")
+        self._follow_task: asyncio.Task[None] | None = None
+        self._follow_start_generation = 0
 
     async def start(self) -> None:
         if self.motion_enabled and self.motion is not None:
@@ -119,6 +140,14 @@ class CollieRuntime:
 
     async def close(self) -> None:
         self._closing = True
+        self._follow_start_generation += 1
+        if self._follow_task is not None:
+            self._follow_task.cancel()
+            try:
+                await self._follow_task
+            except asyncio.CancelledError:
+                pass
+            self._follow_task = None
         if self._task is not None:
             self._task.cancel()
             try:
@@ -144,14 +173,9 @@ class CollieRuntime:
             if not self.allow_unranged_forward:
                 raise RuntimeCommandError("unranged demo motion is disabled")
             async with self._state_lock:
-                target = self._target
-                selected_name = self._selected_target_name
-            if selected_name is None:
-                raise RuntimeCommandError("select a detected fruit first")
-            if target is None or target.visible_frames < self.controller.config.stable_frames_required:
-                raise RuntimeCommandError(
-                    f"{selected_name} is not stably tracked"
-                )
+                readiness = self._follow_readiness_locked(time.monotonic())
+            if readiness is not None:
+                raise RuntimeCommandError(readiness)
             try:
                 lease = await self.motion.arm()
             except MotionError as exc:
@@ -162,12 +186,47 @@ class CollieRuntime:
             self._command = VelocityCommand(reason="armed_waiting_for_hold")
             return await self.status()
 
+    async def start_follow(self, confirmation: str) -> dict[str, object]:
+        generation = self._follow_start_generation
+        deadline = time.monotonic() + self.follow_start_timeout_s
+        while True:
+            if generation != self._follow_start_generation:
+                raise RuntimeCommandError("follow start cancelled")
+            async with self._state_lock:
+                selected_name = self._selected_target_name
+                readiness = self._follow_readiness_locked(time.monotonic())
+            if selected_name is None:
+                raise RuntimeCommandError("select a detected fruit first")
+            if readiness is None:
+                break
+            if readiness not in {
+                "selected_target_not_stable",
+                "selected_target_not_revalidated",
+            }:
+                raise RuntimeCommandError(readiness)
+            if time.monotonic() >= deadline:
+                raise RuntimeCommandError(readiness)
+            await asyncio.sleep(0.025)
+
+        if generation != self._follow_start_generation:
+            raise RuntimeCommandError("follow start cancelled")
+        await self.arm(confirmation)
+        if generation != self._follow_start_generation:
+            await self.stop("follow_start_cancelled")
+            raise RuntimeCommandError("follow start cancelled")
+        if self._follow_task is not None and not self._follow_task.done():
+            await self.stop("follow_already_active")
+            raise RuntimeCommandError("follow is already active")
+        self._follow_task = asyncio.create_task(self._follow_loop())
+        return await self.status()
+
     async def select_target(
         self,
         target_name: str,
         preferred_center: tuple[int, int] | None = None,
     ) -> dict[str, object]:
         canonical_name = self._canonical_target_name(target_name)
+        self._follow_start_generation += 1
         async with self._action_lock:
             if self.motion is not None and (
                 self._lease is not None or self.motion.armed
@@ -179,11 +238,8 @@ class CollieRuntime:
             self._command = VelocityCommand(reason="fruit_selected")
             frame: CameraFrame | None = None
             detection: FruitDetection | None = None
+            selection_error: str | None = None
             async with self._state_lock:
-                self._selected_target_name = canonical_name
-                self._selected_target_hint = preferred_center
-                self._clear_produce_tracker_locked()
-                self._target = None
                 frame = self._latest_frame
                 detection = self._best_produce_detection_locked(
                     canonical_name, preferred_center
@@ -193,8 +249,23 @@ class CollieRuntime:
                     if self._produce_last_at is None
                     else time.monotonic() - self._produce_last_at
                 )
-                if produce_age is None or produce_age > 8.0:
-                    detection = None
+                if (
+                    frame is None
+                    or detection is None
+                    or produce_age is None
+                    or produce_age > self.maximum_produce_age_s
+                ):
+                    self._clear_selection_locked()
+                    selection_error = (
+                        f"{canonical_name} is no longer freshly detected; select it again"
+                    )
+                else:
+                    self._selected_target_name = canonical_name
+                    self._selected_target_hint = preferred_center
+                    self._clear_produce_tracker_locked()
+                    self._target = None
+            if selection_error is not None:
+                raise RuntimeCommandError(selection_error)
             if frame is not None and detection is not None:
                 try:
                     tracker = await asyncio.to_thread(
@@ -203,6 +274,8 @@ class CollieRuntime:
                         self._detection_bbox_xywh(detection),
                     )
                 except Exception as exc:
+                    async with self._state_lock:
+                        self._clear_selection_locked()
                     raise RuntimeCommandError(
                         f"could not initialize {canonical_name} tracker: {exc}"
                     ) from exc
@@ -218,6 +291,7 @@ class CollieRuntime:
                         self._produce_tracker_label = canonical_name
                         self._produce_visible_frames = 1
                         self._produce_verified_at = self._produce_last_at
+                        self._produce_revalidation_failures = 0
                         self._target = observation
             return await self.status()
 
@@ -225,6 +299,8 @@ class CollieRuntime:
         async with self._action_lock:
             if self.motion is None or self._lease is None or not self.motion.armed:
                 self._lease = None
+                if self._command.forward_mps != 0.0 or self._command.yaw_rps != 0.0:
+                    self._command = VelocityCommand(reason="motion_not_armed")
                 raise RuntimeCommandError("motion is not armed")
             now = time.monotonic()
             async with self._state_lock:
@@ -260,6 +336,7 @@ class CollieRuntime:
             return await self.status()
 
     async def stop(self, reason: str = "user_stop") -> dict[str, object]:
+        self._follow_start_generation += 1
         async with self._action_lock:
             if self.motion is not None:
                 await self.motion.emergency_stop()
@@ -281,8 +358,46 @@ class CollieRuntime:
                 None if self._produce_last_at is None else now - self._produce_last_at
             )
             target = self._target
+            device_status = self._produce_device_status()
+            camera_live = frame_age is not None and frame_age < 1.0
+            produce_live = bool(
+                self.produce_detector is not None
+                and produce_age is not None
+                and produce_age < 1.0
+                and not self._produce_error
+            )
+            gpu_ready = bool(
+                device_status.get("cuda_available")
+                and str(device_status.get("resolved", "")).startswith("cuda")
+            )
+            motion_status = None if self.motion is None else self.motion.status()
+            motion_ready = bool(
+                self.motion_enabled
+                and motion_status is not None
+                and motion_status["initialized"]
+                and motion_status["fault"] is None
+            )
+            follow_active = bool(
+                self._follow_task is not None
+                and not self._follow_task.done()
+                and self._lease is not None
+                and self.motion is not None
+                and self.motion.armed
+            )
+            can_follow = (
+                not follow_active
+                and self._follow_readiness_locked(now) is None
+                and motion_ready
+            )
             return {
-                "ok": frame_age is not None and frame_age < 1.0,
+                "ok": camera_live,
+                "stage_ready": camera_live and produce_live and gpu_ready and motion_ready,
+                "health": {
+                    "camera_live": camera_live,
+                    "produce_live": produce_live,
+                    "gpu_ready": gpu_ready,
+                    "motion_ready": motion_ready,
+                },
                 "frame_count": self._frame_count,
                 "frame_age_s": None if frame_age is None else round(frame_age, 3),
                 "last_error": self._last_error,
@@ -306,7 +421,7 @@ class CollieRuntime:
                     "age_s": None if produce_age is None else round(produce_age, 3),
                     "inference_ms": self._produce_inference_ms,
                     "error": self._produce_error,
-                    "device": self._produce_device_status(),
+                    "device": device_status,
                     "tracker": {
                         "label": self._produce_tracker_label,
                         "target": None
@@ -315,10 +430,14 @@ class CollieRuntime:
                         "last_verified_age_s": None
                         if self._produce_verified_at is None
                         else round(now - self._produce_verified_at, 3),
+                        "revalidation_failures": self._produce_revalidation_failures,
+                        "revalidation_failures_required": self.produce_revalidation_misses_required,
                     },
                 },
                 "motion_enabled": self.motion_enabled,
                 "allow_unranged_forward": self.allow_unranged_forward,
+                "can_follow": can_follow,
+                "follow_active": follow_active,
                 "armed": self._lease is not None and self.motion is not None and self.motion.armed,
                 "command": self._command.to_dict(),
                 "forward_budget_s": self.controller.config.forward_budget_s,
@@ -328,7 +447,7 @@ class CollieRuntime:
                     3,
                 ),
                 "arm_confirmation": ARM_CONFIRMATION,
-                "motion": None if self.motion is None else self.motion.status(),
+                "motion": motion_status,
             }
 
     async def _camera_loop(self) -> None:
@@ -466,13 +585,18 @@ class CollieRuntime:
                             )
                             >= self.produce_revalidation_iou
                         )
-                        if tracker_is_active and not detection_matches_track:
-                            self._clear_selection_locked()
-                            revalidation_failed = True
-                        elif selected_detection is None:
-                            self._clear_selection_locked()
-                            revalidation_failed = True
+                        if selected_detection is None or (
+                            tracker_is_active and not detection_matches_track
+                        ):
+                            self._produce_revalidation_failures += 1
+                            if (
+                                self._produce_revalidation_failures
+                                >= self.produce_revalidation_misses_required
+                            ):
+                                self._clear_selection_locked()
+                                revalidation_failed = True
                         else:
+                            self._produce_revalidation_failures = 0
                             refresh_tracker_for = (
                                 selected_name,
                                 selected_detection,
@@ -509,9 +633,45 @@ class CollieRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                revalidation_failed = False
                 async with self._state_lock:
+                    self._produce_detections = []
+                    self._produce_frame_id = frame.frame_id
+                    self._produce_last_at = time.monotonic()
+                    self._produce_inference_ms = round(
+                        (time.monotonic() - started) * 1000.0, 1
+                    )
                     self._produce_error = str(exc)
+                    if self._selected_target_name is not None:
+                        self._produce_revalidation_failures += 1
+                        if (
+                            self._produce_revalidation_failures
+                            >= self.produce_revalidation_misses_required
+                        ):
+                            self._clear_selection_locked()
+                            revalidation_failed = True
+                if revalidation_failed:
+                    await self.stop("selected_target_not_revalidated")
             await asyncio.sleep(0)
+
+    async def _follow_loop(self) -> None:
+        current_task = asyncio.current_task()
+        try:
+            while not self._closing:
+                try:
+                    await self.pulse()
+                except RuntimeCommandError:
+                    break
+                await asyncio.sleep(self.follow_period_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            async with self._state_lock:
+                self._last_error = f"follow loop failed: {exc}"
+            await self.stop("follow_loop_error")
+        finally:
+            if self._follow_task is current_task:
+                self._follow_task = None
 
     async def _release_locked(self, reason: str) -> None:
         if self.motion is not None and self._lease is not None:
@@ -564,6 +724,7 @@ class CollieRuntime:
         self._produce_tracker_label = None
         self._produce_visible_frames = 0
         self._produce_verified_at = None
+        self._produce_revalidation_failures = 0
 
     def _clear_selection_locked(self) -> None:
         self._selected_target_name = None
@@ -576,8 +737,33 @@ class CollieRuntime:
             return {"requested": "disabled", "resolved": "disabled"}
         status = getattr(self.produce_detector, "device_status", None)
         if callable(status):
-            return status()
+            try:
+                return status()
+            except Exception as exc:
+                return {
+                    "requested": "unknown",
+                    "resolved": "error",
+                    "error": str(exc),
+                }
         return {"requested": "test", "resolved": "test"}
+
+    def _follow_readiness_locked(self, now: float) -> str | None:
+        if self._selected_target_name is None:
+            return "select a detected fruit first"
+        if self._target is None:
+            return "selected_target_not_found"
+        if self._target.visible_frames < self.controller.config.stable_frames_required:
+            return "selected_target_not_stable"
+        target_age = now - self._target.captured_monotonic_s
+        if target_age < 0.0 or target_age > self.controller.config.maximum_target_age_s:
+            return "selected_target_stale"
+        if (
+            self._produce_verified_at is None
+            or now - self._produce_verified_at > self.maximum_produce_age_s
+            or self._produce_revalidation_failures > 0
+        ):
+            return "selected_target_not_revalidated"
+        return None
 
     @staticmethod
     def _target_detection_iou(

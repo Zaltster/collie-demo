@@ -1,20 +1,22 @@
 from pathlib import Path
 
 
-def test_one_click_follow_serializes_motion_pulses() -> None:
+def test_one_click_follow_is_owned_by_robot_service() -> None:
     html = (Path(__file__).parents[1] / "web" / "index.html").read_text()
 
     assert "setInterval(pulse" not in html
-    assert "if(pulseLoopRunning)return" in html
-    assert "while(following)" in html
-    assert "await api('/api/pulse')" in html
+    assert "pulseLoopRunning" not in html
+    assert "while(following)" not in html
+    assert "await api('/api/pulse')" not in html
     assert "follow.onclick=beginFollow" in html
-    assert "await api('/api/arm',{confirmation:'TARGET AND PATH CLEAR'})" in html
+    assert "await api('/api/follow',{confirmation:'TARGET AND PATH CLEAR'})" in html
+    assert "Robot-side follow is active" in html
     assert "PRESS AND HOLD" not in html
     assert "pointerdown" not in html
     assert "addEventListener('blur',endFollow)" not in html
     assert "visibilitychange" not in html
     assert "addEventListener('pagehide',endFollow)" in html
+    assert "keepalive:true" in html
 
 
 def test_each_detection_gets_an_exact_select_control() -> None:
@@ -43,4 +45,15 @@ def test_tracker_confidence_is_not_presented_as_live_yolo_confidence() -> None:
 
     assert "tracker awaiting YOLO check" in html
     assert "observation.confidence===null" in html
-    assert "selected_target_not_revalidated" in html
+    assert "revalidation_failures" in html
+    assert "revalidation_failures_required" in html
+
+
+def test_stage_health_is_visible_in_the_ui() -> None:
+    html = (Path(__file__).parents[1] / "web" / "index.html").read_text()
+
+    assert "STAGE READY" in html
+    assert "failedHealth" in html
+    assert "gpu_ready" not in html  # rendered generically from the health object
+    assert "YOLO verified" in html
+    assert "misses ${misses}/${required}" in html

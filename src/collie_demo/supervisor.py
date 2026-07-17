@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -44,13 +45,15 @@ def main() -> None:
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
     deadline = time.monotonic() + 35.0
+    failure_limit = int(os.environ.get("COLLIE_SUPERVISOR_FAILURE_LIMIT", "12"))
     healthy_once = False
     failures = 0
     while child.poll() is None and not terminating:
         try:
             with urllib.request.urlopen(url, timeout=0.5) as response:
-                probe_ok = response.status == 200
-        except (urllib.error.URLError, OSError, ValueError):
+                payload = json.load(response)
+                probe_ok = response.status == 200 and payload.get("stage_ready") is True
+        except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
             probe_ok = False
         if probe_ok:
             healthy_once = True
@@ -58,8 +61,8 @@ def main() -> None:
         elif healthy_once:
             failures += 1
         elif time.monotonic() >= deadline:
-            failures = 3
-        if failures >= 3:
+            failures = failure_limit
+        if failures >= failure_limit:
             try:
                 emergency_brake()
             finally:
