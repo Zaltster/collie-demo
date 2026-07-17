@@ -12,6 +12,9 @@ def test_one_click_follow_serializes_motion_pulses() -> None:
     assert "await api('/api/arm',{confirmation:'TARGET AND PATH CLEAR'})" in html
     assert "PRESS AND HOLD" not in html
     assert "pointerdown" not in html
+    assert "addEventListener('blur',endFollow)" not in html
+    assert "visibilitychange" not in html
+    assert "addEventListener('pagehide',endFollow)" in html
 
 
 def test_each_detection_gets_an_exact_select_control() -> None:

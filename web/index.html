@@ -39,7 +39,7 @@
     </section>
     <section class="panel">
       <b>2. Follow with one click</b>
-      <p class="muted">Click once to approach. Losing the fruit, losing the page, or reaching the time budget stops motion.</p>
+      <p class="muted">Tap once—do not hold—to approach. Losing the fruit, leaving the page, or reaching the time budget stops motion.</p>
       <button id="follow" disabled>FOLLOW SELECTED FRUIT</button>
       <p><button id="stop">STOP NOW</button></p>
     </section>
@@ -104,7 +104,7 @@
     }
     function endFollow(){const shouldStop=following||startingFollow||pulseLoopRunning;following=false;startingFollow=false;if(shouldStop)stopMotion().finally(refresh)}
     async function emergencyStop(){following=false;startingFollow=false;await stopMotion();targetFeedback.textContent='Stopped.';await refresh()}
-    follow.onclick=beginFollow;window.addEventListener('blur',endFollow);document.addEventListener('visibilitychange',()=>{if(document.hidden)endFollow()});stop.onclick=emergencyStop;
+    follow.onclick=beginFollow;window.addEventListener('pagehide',endFollow);stop.onclick=emergencyStop;
     refresh();setInterval(refresh,250);
   </script>
 </body>
