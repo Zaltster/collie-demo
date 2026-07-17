@@ -57,3 +57,7 @@ def test_stage_health_is_visible_in_the_ui() -> None:
     assert "gpu_ready" not in html  # rendered generically from the health object
     assert "YOLO verified" in html
     assert "misses ${misses}/${required}" in html
+    assert "WAITING FOR STABLE TRACK" in html
+    assert "WAITING FOR YOLO" in html
+    assert "WAITING FOR FRESH FRAME" in html
+    assert "s.follow_readiness" in html

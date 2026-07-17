@@ -72,8 +72,10 @@
       if(!observation)return 'not tracked';
       return observation.confidence===null?`${observation.visible_frames} frames · tracker awaiting YOLO check`:`${observation.visible_frames} frames · YOLO ${Math.round(observation.confidence*100)}%`;
     }
-    function updateFollowButton(canFollow){
-      follow.textContent=following?'FOLLOWING…':'FOLLOW SELECTED FRUIT';
+    function updateFollowButton(canFollow,readiness=''){
+      const waiting=readiness==='selected_target_not_stable'?'WAITING FOR STABLE TRACK':readiness==='selected_target_not_revalidated'?'WAITING FOR YOLO':readiness==='selected_target_stale'?'WAITING FOR FRESH FRAME':'FOLLOW SELECTED FRUIT';
+      follow.textContent=following?'FOLLOWING…':startingFollow?'STARTING…':canFollow?'FOLLOW SELECTED FRUIT':waiting;
+      follow.title=canFollow?'Ready to follow':readiness.replaceAll('_',' ');
       follow.disabled=following||startingFollow||!canFollow;
     }
     async function refresh(){
@@ -87,7 +89,7 @@
         following=Boolean(s.follow_active);
         const tracker=s.produce?.tracker,misses=tracker?.revalidation_failures??0,required=tracker?.revalidation_failures_required??3,verified=tracker?.last_verified_age_s;
         monitor.textContent=`camera ${s.frame_age_s??'—'}s · YOLO verified ${verified??'—'}s ago · misses ${misses}/${required} · motion ${s.motion?.fault||((s.health?.motion_ready)?'ready':'not ready')}`;
-        renderProduce(s.produce,selected,s.selected_target_hint);updateFollowButton(Boolean(s.can_follow));
+        renderProduce(s.produce,selected,s.selected_target_hint);updateFollowButton(Boolean(s.can_follow),s.follow_readiness||'');
         if(camera.complete)camera.src=`/camera.jpg?t=${Date.now()}`
       }catch(e){live.textContent='APP UNAVAILABLE';live.className='pill bad'}finally{refreshInFlight=false}
     }
@@ -98,7 +100,7 @@
     }
     async function stopMotion(){if(!stopPromise)stopPromise=api('/api/stop').catch(()=>{}).finally(()=>{stopPromise=null});return stopPromise}
     async function beginFollow(){
-      if(following||startingFollow)return;startingFollow=true;updateFollowButton(true);
+      if(following||startingFollow)return;startingFollow=true;updateFollowButton(false,'starting');
       try{const s=await api('/api/follow',{confirmation:'TARGET AND PATH CLEAR'});following=Boolean(s.follow_active);targetFeedback.textContent='Robot-side follow is active. Press Stop Now to stop early.'}
       catch(e){if(startingFollow){targetFeedback.textContent=e.message;alert(e.message)}}
       finally{startingFollow=false;await refresh()}

@@ -89,6 +89,12 @@ class BurstMissProduceDetector(FakeProduceDetector):
         return super().detect(image)
 
 
+class SlowProduceDetector(FakeProduceDetector):
+    def detect(self, image: object) -> list[FruitDetection]:
+        time.sleep(0.4)
+        return super().detect(image)
+
+
 class FakeProduceTracker:
     def __init__(self, bbox: tuple[int, int, int, int]) -> None:
         self.bbox = bbox
@@ -422,6 +428,51 @@ def test_three_yolo_misses_stop_an_active_robot_side_follow() -> None:
             assert status["command"]["reason"] == "selected_target_not_revalidated"
             assert sport.stop_calls >= 1
             assert avoidance.moves[-1] == (0.0, 0.0, 0.0)
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_old_yolo_result_does_not_replace_fresh_tracker_observation() -> None:
+    async def scenario() -> None:
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(
+                ApproachConfig(stable_frames_required=3)
+            ),
+            motion=UnitreeMotionAdapter(FakeSport(), FakeAvoidance()),
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            produce_detector=SlowProduceDetector(),
+            produce_tracker_factory=fake_tracker_factory,
+            loop_hz=60.0,
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                status = await runtime.status()
+                if status["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("slow detector never returned a frame")
+
+            await runtime.select_target("banana", (350, 240))
+            await asyncio.sleep(0.1)
+            target_ages: list[float] = []
+            readiness: list[str] = []
+            for _ in range(60):
+                status = await runtime.status()
+                if status["selected_target_age_s"] is not None:
+                    target_ages.append(status["selected_target_age_s"])
+                readiness.append(status["follow_readiness"])
+                await asyncio.sleep(0.02)
+
+            assert target_ages
+            assert max(target_ages) < 0.35
+            assert "selected_target_stale" not in readiness
+            assert status["can_follow"] is True
         finally:
             await runtime.close()
 

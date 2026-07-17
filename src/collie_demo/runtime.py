@@ -384,9 +384,10 @@ class CollieRuntime:
                 and self.motion is not None
                 and self.motion.armed
             )
+            follow_readiness = self._follow_readiness_locked(now)
             can_follow = (
                 not follow_active
-                and self._follow_readiness_locked(now) is None
+                and follow_readiness is None
                 and motion_ready
             )
             return {
@@ -437,6 +438,9 @@ class CollieRuntime:
                 "motion_enabled": self.motion_enabled,
                 "allow_unranged_forward": self.allow_unranged_forward,
                 "can_follow": can_follow,
+                "follow_readiness": "ready"
+                if follow_readiness is None
+                else follow_readiness,
                 "follow_active": follow_active,
                 "armed": self._lease is not None and self.motion is not None and self.motion.armed,
                 "command": self._command.to_dict(),
@@ -629,7 +633,15 @@ class CollieRuntime:
                             self._produce_visible_frames = max(1, visible_frames)
                             self._produce_verified_at = time.monotonic()
                             self._selected_target_hint = selected_detection.center
-                            self._target = observation
+                            # YOLO finishes after its source frame was captured.
+                            # Never replace a newer camera-loop tracker result
+                            # with that older inference-frame observation.
+                            if (
+                                self._target is None
+                                or observation.captured_monotonic_s
+                                >= self._target.captured_monotonic_s
+                            ):
+                                self._target = observation
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
