@@ -13,11 +13,15 @@ def test_hold_control_serializes_motion_pulses() -> None:
 def test_target_controls_support_buttons_typed_phrases_and_speech() -> None:
     html = (Path(__file__).parents[1] / "web" / "index.html").read_text()
 
-    assert "Choose blue" in html
-    assert "Choose yellow" in html
+    assert "Blue whale" in html
+    assert "Yellow whale" in html
+    assert "Apple" in html
+    assert "Banana" in html
     assert "choose the yellow" in html
     assert "choose the blue" in html
-    assert "await api('/api/target',{color})" in html
+    assert "choose the apple" in html
+    assert "choose the banana" in html
+    assert "await api('/api/target',{color:name})" in html
     assert "window.SpeechRecognition||window.webkitSpeechRecognition" in html
 
 

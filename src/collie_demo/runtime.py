@@ -3,16 +3,20 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import time
-from typing import Protocol
+from typing import Callable, Protocol
+
+import cv2
 
 from .controller import ApproachController
 from .detector import BlueWhaleDetector, YellowWhaleDetector, annotate_whales
-from .fruit import FruitDetection, annotate_fruits
+from .fruit import FruitDetection, annotate_fruits, annotate_selected_produce
 from .motion import MotionError, MotionNotReady, UnitreeMotionAdapter
 from .types import BlueWhaleObservation, CameraFrame, VelocityCommand
 
 
-ARM_CONFIRMATION = "WHALE AND PATH CLEAR"
+ARM_CONFIRMATION = "TARGET AND PATH CLEAR"
+PRODUCE_TARGETS = frozenset({"apple", "banana"})
+WHALE_TARGETS = frozenset({"blue", "yellow"})
 
 
 class CameraProtocol(Protocol):
@@ -25,6 +29,25 @@ class ProduceDetectorProtocol(Protocol):
     names: dict[int, str]
 
     def detect(self, bgr: object) -> list[FruitDetection]: ...
+
+
+class ProduceTrackerProtocol(Protocol):
+    def update(
+        self, bgr: object
+    ) -> tuple[bool, tuple[float, float, float, float]]: ...
+
+
+ProduceTrackerFactory = Callable[
+    [object, tuple[int, int, int, int]], ProduceTrackerProtocol
+]
+
+
+def create_produce_tracker(
+    bgr: object, bbox_xywh: tuple[int, int, int, int]
+) -> ProduceTrackerProtocol:
+    tracker = cv2.TrackerMIL_create()
+    tracker.init(bgr, bbox_xywh)
+    return tracker
 
 
 class RuntimeCommandError(RuntimeError):
@@ -43,6 +66,7 @@ class CollieRuntime:
         motion_enabled: bool,
         allow_unranged_forward: bool,
         produce_detector: ProduceDetectorProtocol | None = None,
+        produce_tracker_factory: ProduceTrackerFactory | None = None,
         loop_hz: float = 8.0,
     ) -> None:
         self.camera = camera
@@ -55,6 +79,9 @@ class CollieRuntime:
         self.motion_enabled = bool(motion_enabled)
         self.allow_unranged_forward = bool(allow_unranged_forward)
         self.produce_detector = produce_detector
+        self.produce_tracker_factory = (
+            produce_tracker_factory or create_produce_tracker
+        )
         self.loop_hz = float(loop_hz)
         self._state_lock = asyncio.Lock()
         self._action_lock = asyncio.Lock()
@@ -63,11 +90,15 @@ class CollieRuntime:
         self._closing = False
         self._jpeg: bytes | None = None
         self._latest_frame: CameraFrame | None = None
-        self._selected_color = "blue"
+        self._selected_target_name = "blue"
         self._targets: dict[str, BlueWhaleObservation | None] = {
             color: None for color in self.detectors
         }
         self._target: BlueWhaleObservation | None = None
+        self._produce_tracker: ProduceTrackerProtocol | None = None
+        self._produce_tracker_label: str | None = None
+        self._produce_tracker_confidence = 0.0
+        self._produce_visible_frames = 0
         self._produce_detections: list[FruitDetection] = []
         self._produce_frame_id: int | None = None
         self._produce_last_at: float | None = None
@@ -121,10 +152,10 @@ class CollieRuntime:
                 raise RuntimeCommandError("unranged demo motion is disabled")
             async with self._state_lock:
                 target = self._target
-                selected_color = self._selected_color
+                selected_name = self._selected_target_name
             if target is None or target.visible_frames < self.controller.config.stable_frames_required:
                 raise RuntimeCommandError(
-                    f"{selected_color} whale is not stably detected"
+                    f"{selected_name} is not stably tracked"
                 )
             try:
                 lease = await self.motion.arm()
@@ -136,10 +167,11 @@ class CollieRuntime:
             self._command = VelocityCommand(reason="armed_waiting_for_hold")
             return await self.status()
 
-    async def select_target(self, color: str) -> dict[str, object]:
-        normalized = color.strip().lower()
-        if normalized not in self.detectors:
-            choices = ", ".join(sorted(self.detectors))
+    async def select_target(self, target_name: str) -> dict[str, object]:
+        normalized = target_name.strip().lower()
+        selectable_targets = WHALE_TARGETS | PRODUCE_TARGETS
+        if normalized not in selectable_targets:
+            choices = ", ".join(sorted(selectable_targets))
             raise RuntimeCommandError(f"target must be one of: {choices}")
         async with self._action_lock:
             if self.motion is not None and (
@@ -149,10 +181,49 @@ class CollieRuntime:
             self._lease = None
             self._last_pulse_at = None
             self._forward_elapsed_s = 0.0
-            self._command = VelocityCommand(reason=f"{normalized}_whale_selected")
+            self._command = VelocityCommand(reason=f"{normalized}_selected")
+            frame: CameraFrame | None = None
+            detection: FruitDetection | None = None
             async with self._state_lock:
-                self._selected_color = normalized
-                self._target = self._targets.get(normalized)
+                self._selected_target_name = normalized
+                self._clear_produce_tracker_locked()
+                if normalized in WHALE_TARGETS:
+                    self._target = self._targets.get(normalized)
+                else:
+                    self._target = None
+                    frame = self._latest_frame
+                    detection = self._best_produce_detection_locked(normalized)
+                    produce_age = (
+                        None
+                        if self._produce_last_at is None
+                        else time.monotonic() - self._produce_last_at
+                    )
+                    if produce_age is None or produce_age > 8.0:
+                        detection = None
+            if frame is not None and detection is not None:
+                try:
+                    tracker = await asyncio.to_thread(
+                        self.produce_tracker_factory,
+                        frame.bgr.copy(),
+                        self._detection_bbox_xywh(detection),
+                    )
+                except Exception as exc:
+                    raise RuntimeCommandError(
+                        f"could not initialize {normalized} tracker: {exc}"
+                    ) from exc
+                observation = self._observation_from_bbox(
+                    frame,
+                    self._detection_bbox_xywh(detection),
+                    confidence=detection.confidence,
+                    visible_frames=1,
+                )
+                async with self._state_lock:
+                    if self._selected_target_name == normalized:
+                        self._produce_tracker = tracker
+                        self._produce_tracker_label = normalized
+                        self._produce_tracker_confidence = detection.confidence
+                        self._produce_visible_frames = 1
+                        self._target = observation
             return await self.status()
 
     async def pulse(self) -> dict[str, object]:
@@ -174,9 +245,9 @@ class CollieRuntime:
                 allow_unranged_forward=self.allow_unranged_forward,
             )
             unsafe_reasons = {
-                "selected_whale_not_found",
-                "selected_whale_not_stable",
-                "selected_whale_stale",
+                "selected_target_not_found",
+                "selected_target_not_stable",
+                "selected_target_stale",
                 "frame_geometry_missing",
                 "unranged_forward_disabled",
                 "forward_budget_complete",
@@ -226,10 +297,22 @@ class CollieRuntime:
                 "frame_count": self._frame_count,
                 "frame_age_s": None if frame_age is None else round(frame_age, 3),
                 "last_error": self._last_error,
-                "selected_target_color": self._selected_color,
-                "selected_whale": None if target is None else target.to_dict(),
-                "selected_whale_age_s": None
+                "selected_target_name": self._selected_target_name,
+                "selected_target_kind": "whale"
+                if self._selected_target_name in WHALE_TARGETS
+                else "produce",
+                "selected_target": None if target is None else target.to_dict(),
+                "selected_target_age_s": None
                 if target_age is None
+                else round(target_age, 3),
+                "selected_target_color": self._selected_target_name
+                if self._selected_target_name in WHALE_TARGETS
+                else None,
+                "selected_whale": None
+                if self._selected_target_name not in WHALE_TARGETS or target is None
+                else target.to_dict(),
+                "selected_whale_age_s": None
+                if self._selected_target_name not in WHALE_TARGETS or target_age is None
                 else round(target_age, 3),
                 "whales": {
                     color: None if item is None else item.to_dict()
@@ -255,6 +338,12 @@ class CollieRuntime:
                     "age_s": None if produce_age is None else round(produce_age, 3),
                     "inference_ms": self._produce_inference_ms,
                     "error": self._produce_error,
+                    "tracker": {
+                        "label": self._produce_tracker_label,
+                        "target": None
+                        if self._produce_tracker_label is None or target is None
+                        else target.to_dict(),
+                    },
                 },
                 "motion_enabled": self.motion_enabled,
                 "allow_unranged_forward": self.allow_unranged_forward,
@@ -284,19 +373,61 @@ class CollieRuntime:
                 async with self._state_lock:
                     self._latest_frame = frame
                     produce_detections = list(self._produce_detections)
-                    selected_color = self._selected_color
+                    selected_name = self._selected_target_name
+                    tracker = self._produce_tracker
+                    tracker_label = self._produce_tracker_label
+                    tracker_confidence = self._produce_tracker_confidence
+                    tracker_visible_frames = self._produce_visible_frames
+                tracked_produce: BlueWhaleObservation | None = None
+                if (
+                    selected_name in PRODUCE_TARGETS
+                    and tracker is not None
+                    and tracker_label == selected_name
+                ):
+                    tracker_ok, tracker_bbox = await asyncio.to_thread(
+                        tracker.update, frame.bgr
+                    )
+                    if tracker_ok:
+                        tracked_produce = self._observation_from_bbox(
+                            frame,
+                            tuple(int(round(value)) for value in tracker_bbox),
+                            confidence=tracker_confidence,
+                            visible_frames=tracker_visible_frames + 1,
+                        )
                 produce_image = annotate_fruits(frame.bgr, produce_detections)
+                produce_image = annotate_selected_produce(
+                    produce_image,
+                    selected_name if selected_name in PRODUCE_TARGETS else None,
+                    tracked_produce,
+                )
                 annotated_frame = CameraFrame(
                     frame.frame_id, frame.captured_monotonic_s, produce_image
                 )
                 jpeg = annotate_whales(
                     annotated_frame,
                     targets,
-                    selected_color=selected_color,
+                    selected_color=(
+                        selected_name if selected_name in WHALE_TARGETS else None
+                    ),
                 )
                 async with self._state_lock:
-                    selected_color = self._selected_color
-                    selected_target = targets.get(selected_color)
+                    current_name = self._selected_target_name
+                    if current_name in WHALE_TARGETS:
+                        selected_target = targets.get(current_name)
+                    elif (
+                        current_name == selected_name
+                        and self._produce_tracker is tracker
+                        and self._produce_tracker_label == current_name
+                    ):
+                        selected_target = tracked_produce
+                        self._produce_visible_frames = (
+                            0 if tracked_produce is None else tracked_produce.visible_frames
+                        )
+                        if tracked_produce is None:
+                            self._produce_tracker = None
+                            self._produce_tracker_label = None
+                    else:
+                        selected_target = self._target
                     self._jpeg = jpeg
                     self._targets = targets
                     self._target = selected_target
@@ -314,11 +445,13 @@ class CollieRuntime:
             except Exception as exc:
                 async with self._state_lock:
                     self._targets = {color: None for color in self.detectors}
+                    if self._selected_target_name in PRODUCE_TARGETS:
+                        self._clear_produce_tracker_locked()
                     self._target = None
                     self._last_error = str(exc)
                 lost_while_armed = self._lease is not None
             if lost_while_armed:
-                await self.stop("selected_whale_lost")
+                await self.stop("selected_target_lost")
             await asyncio.sleep(max(0.0, period - (time.monotonic() - started)))
 
     async def _produce_loop(self) -> None:
@@ -345,6 +478,40 @@ class CollieRuntime:
                     self._produce_last_at = time.monotonic()
                     self._produce_inference_ms = round(inference_ms, 1)
                     self._produce_error = ""
+                    selected_name = self._selected_target_name
+                    current_frame = self._latest_frame
+                    selected_detection = (
+                        self._best_produce_detection_locked(selected_name)
+                        if selected_name in PRODUCE_TARGETS
+                        and self._produce_tracker is None
+                        and self._lease is None
+                        else None
+                    )
+                if current_frame is not None and selected_detection is not None:
+                    tracker = await asyncio.to_thread(
+                        self.produce_tracker_factory,
+                        current_frame.bgr.copy(),
+                        self._detection_bbox_xywh(selected_detection),
+                    )
+                    observation = self._observation_from_bbox(
+                        current_frame,
+                        self._detection_bbox_xywh(selected_detection),
+                        confidence=selected_detection.confidence,
+                        visible_frames=1,
+                    )
+                    async with self._state_lock:
+                        if (
+                            self._selected_target_name == selected_name
+                            and self._produce_tracker is None
+                            and self._lease is None
+                        ):
+                            self._produce_tracker = tracker
+                            self._produce_tracker_label = selected_name
+                            self._produce_tracker_confidence = (
+                                selected_detection.confidence
+                            )
+                            self._produce_visible_frames = 1
+                            self._target = observation
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -361,3 +528,48 @@ class CollieRuntime:
         self._lease = None
         self._last_pulse_at = None
         self._command = VelocityCommand(reason=reason)
+
+    def _best_produce_detection_locked(
+        self, label: str
+    ) -> FruitDetection | None:
+        matches = [
+            item
+            for item in self._produce_detections
+            if item.label.casefold() == label.casefold()
+        ]
+        return max(matches, key=lambda item: item.confidence, default=None)
+
+    def _clear_produce_tracker_locked(self) -> None:
+        self._produce_tracker = None
+        self._produce_tracker_label = None
+        self._produce_tracker_confidence = 0.0
+        self._produce_visible_frames = 0
+
+    @staticmethod
+    def _detection_bbox_xywh(
+        detection: FruitDetection,
+    ) -> tuple[int, int, int, int]:
+        x1, y1, x2, y2 = detection.bbox_xyxy
+        return x1, y1, max(1, x2 - x1), max(1, y2 - y1)
+
+    @staticmethod
+    def _observation_from_bbox(
+        frame: CameraFrame,
+        bbox_xywh: tuple[int, int, int, int],
+        *,
+        confidence: float,
+        visible_frames: int,
+    ) -> BlueWhaleObservation:
+        x, y, width, height = bbox_xywh
+        x = max(0, min(frame.width - 1, x))
+        y = max(0, min(frame.height - 1, y))
+        width = max(1, min(frame.width - x, width))
+        height = max(1, min(frame.height - y, height))
+        return BlueWhaleObservation(
+            frame_id=frame.frame_id,
+            captured_monotonic_s=frame.captured_monotonic_s,
+            bbox_xywh=(x, y, width, height),
+            center=(x + width // 2, y + height // 2),
+            confidence=round(confidence, 4),
+            visible_frames=visible_frames,
+        )

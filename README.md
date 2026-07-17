@@ -1,7 +1,8 @@
 # Collie Demo
 
-A self-contained Wendy app for Woof with guarded blue/yellow-whale selection
-and approach plus the SnapStock YOLOv8m fruit and vegetable detector.
+A self-contained Wendy app for Woof with guarded blue/yellow-whale, apple, and
+banana selection and approach plus the SnapStock YOLOv8m fruit and vegetable
+detector.
 Frames come directly from Unitree's public `VideoClient`; inference,
 annotation, motion supervision, and the browser UI all run locally in the
 robot container. No Roboflow service, hosted inference API, Hugging Face key,
@@ -17,19 +18,23 @@ or internet connection is used at runtime.
 - Uses a 50% confidence threshold by default.
 - Independently tracks the blue and yellow whale color targets at the original
   camera-loop rate.
-- Selects either target with the UI buttons or the phrases `choose the blue`
-  and `choose the yellow`. The browser exposes speech recognition when its
+- Selects a whale, apple, or banana with UI buttons or phrases such as
+  `choose the blue`, `choose the yellow`, `choose the apple`, and
+  `choose the banana`. The browser exposes speech recognition when its
   security and microphone settings permit it; the typed command always works.
-- Continuously steers from the latest observation of the selected whale.
-- Disarms whenever the selected color changes, so changing targets cannot
+- Uses YOLO to recognize apple or banana, then follows only the selected
+  produce box with a fast camera-loop MIL tracker so motion never steers from
+  the several-seconds-old inference frame.
+- Continuously steers from the latest observation of the selected object.
+- Disarms whenever the selected object changes, so changing targets cannot
   redirect an active motion burst.
 - Runs produce inference in a separate worker so a slow YOLO frame cannot
   block hold pulses, stop commands, or the independent motion watchdog.
 - Keeps the exact arm confirmation, press-and-hold control, factory avoidance,
   forward time budget, target-loss stop, and `StopMove` safety boundary.
 
-Produce detections are informational. Only the selected blue or yellow whale
-can satisfy the motion controller's target gate.
+Only blue whale, yellow whale, apple, and banana are selectable motion targets.
+All other produce detections remain informational.
 
 ## Model
 

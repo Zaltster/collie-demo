@@ -18,7 +18,7 @@ class ArmRequest(BaseModel):
 
 class TargetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    color: Literal["blue", "yellow"]
+    color: Literal["blue", "yellow", "apple", "banana"]
 
 
 def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
@@ -30,7 +30,7 @@ def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
         finally:
             await runtime.close()
 
-    app = FastAPI(title="Collie color-whale demo", version="1", lifespan=lifespan)
+    app = FastAPI(title="Collie object-approach demo", version="1", lifespan=lifespan)
 
     @app.get("/")
     def index() -> FileResponse:

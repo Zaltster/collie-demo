@@ -29,7 +29,7 @@ def test_off_center_target_curves_forward_while_turning() -> None:
     )
     assert command.forward_mps == 0.08
     assert command.yaw_rps < 0.0
-    assert command.reason == "curving_to_selected_whale"
+    assert command.reason == "curving_to_selected_target"
 
 
 def test_centered_target_requires_explicit_unranged_flag() -> None:

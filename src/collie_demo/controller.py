@@ -35,12 +35,12 @@ class ApproachController:
         allow_unranged_forward: bool,
     ) -> VelocityCommand:
         if target is None:
-            return VelocityCommand(reason="selected_whale_not_found")
+            return VelocityCommand(reason="selected_target_not_found")
         if target.visible_frames < self.config.stable_frames_required:
-            return VelocityCommand(reason="selected_whale_not_stable")
+            return VelocityCommand(reason="selected_target_not_stable")
         age = now_monotonic_s - target.captured_monotonic_s
         if not math.isfinite(age) or age < 0.0 or age > self.config.maximum_target_age_s:
-            return VelocityCommand(reason="selected_whale_stale")
+            return VelocityCommand(reason="selected_target_stale")
         if frame_width is None or frame_width < 2:
             return VelocityCommand(reason="frame_geometry_missing")
         if not allow_unranged_forward:
@@ -61,7 +61,7 @@ class ApproachController:
             return VelocityCommand(
                 forward_mps=self.config.forward_mps,
                 yaw_rps=yaw,
-                reason="curving_to_selected_whale",
+                reason="curving_to_selected_target",
             )
         return VelocityCommand(
             forward_mps=self.config.forward_mps,

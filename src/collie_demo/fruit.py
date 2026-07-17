@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from .types import BlueWhaleObservation
+
 
 @dataclass(frozen=True, slots=True)
 class FruitDetection:
@@ -117,6 +119,31 @@ def annotate_fruits(
             2,
             cv2.LINE_AA,
         )
+    return annotated
+
+
+def annotate_selected_produce(
+    bgr: NDArray[np.uint8],
+    label: str | None,
+    target: BlueWhaleObservation | None,
+) -> NDArray[np.uint8]:
+    if label is None or target is None:
+        return bgr
+    annotated = bgr.copy()
+    x, y, width, height = target.bbox_xywh
+    color = (255, 80, 255)
+    cv2.rectangle(annotated, (x, y), (x + width, y + height), color, 5)
+    cv2.circle(annotated, target.center, 6, (255, 255, 255), -1)
+    cv2.putText(
+        annotated,
+        f"SELECTED {label.upper()} TRACKED {target.confidence:.2f}",
+        (max(8, x), max(24, y - 10)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
     return annotated
 
 

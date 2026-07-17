@@ -188,7 +188,7 @@ def annotate_whales(
     frame: CameraFrame,
     targets: dict[str, BlueWhaleObservation | None],
     *,
-    selected_color: str,
+    selected_color: str | None,
 ) -> bytes:
     image = frame.bgr.copy()
     palette = {"blue": (255, 255, 0), "yellow": (0, 220, 255)}
@@ -217,8 +217,8 @@ def annotate_whales(
             2,
             cv2.LINE_AA,
         )
-    selected = targets.get(selected_color)
-    if selected is None:
+    selected = targets.get(selected_color) if selected_color is not None else None
+    if selected_color is not None and selected is None:
         cv2.putText(
             image,
             f"SELECTED {selected_color.upper()} WHALE NOT FOUND - MOTION ZERO",
