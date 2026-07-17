@@ -1,4 +1,4 @@
-"""Small blue-whale detector tuned for Woof's bright floor view."""
+"""Small color-whale detectors tuned for Woof's bright floor view."""
 
 from __future__ import annotations
 
@@ -10,23 +10,27 @@ import numpy as np
 from .types import BlueWhaleObservation, CameraFrame
 
 
-class BlueWhaleDetector:
-    """Detect a cyan/blue toy and retain a short stable track.
+class ColorWhaleDetector:
+    """Detect a color-coded toy and retain a short stable track.
 
     This is deliberately a named-demo detector, not a general object model.
-    It combines blue/cyan chroma with a floor-region and component-size gate.
+    It combines chroma with a floor-region and component-size gate.
     """
 
     def __init__(
         self,
         *,
-        minimum_blue_score: float = 18.0,
+        color: str,
+        minimum_color_score: float = 18.0,
         floor_start_fraction: float = 0.65,
         horizontal_start_fraction: float = 0.08,
         horizontal_end_fraction: float = 0.95,
         maximum_center_jump_px: float = 110.0,
     ) -> None:
-        self.minimum_blue_score = float(minimum_blue_score)
+        if color not in {"blue", "yellow"}:
+            raise ValueError(f"unsupported whale color: {color}")
+        self.color = color
+        self.minimum_color_score = float(minimum_color_score)
         self.floor_start_fraction = float(floor_start_fraction)
         self.horizontal_start_fraction = float(horizontal_start_fraction)
         self.horizontal_end_fraction = float(horizontal_end_fraction)
@@ -39,12 +43,11 @@ class BlueWhaleDetector:
         height, width = image.shape[:2]
         pixels = image.astype(np.float32)
         blue, green, red = pixels[:, :, 0], pixels[:, :, 1], pixels[:, :, 2]
-        blue_score = (blue + green) / 2.0 - red
+        color_score = self._color_score(blue, green, red)
         brightness = np.maximum(np.maximum(blue, green), red)
         yy, xx = np.indices((height, width))
         mask = (
-            (blue_score >= self.minimum_blue_score)
-            & (brightness >= 125.0)
+            self._color_mask(image, color_score, brightness)
             & (yy >= height * self.floor_start_fraction)
             & (xx >= width * self.horizontal_start_fraction)
             & (xx <= width * self.horizontal_end_fraction)
@@ -72,7 +75,7 @@ class BlueWhaleDetector:
                 continue
             cx, cy = (int(round(v)) for v in centroids[label])
             component = mask[y : y + box_height, x : x + box_width] > 0
-            scores = blue_score[y : y + box_height, x : x + box_width][component]
+            scores = color_score[y : y + box_height, x : x + box_width][component]
             mean_score = float(np.mean(scores)) if scores.size else 0.0
             confidence = min(0.99, 0.45 + area / 1800.0 + mean_score / 180.0)
             candidates.append(
@@ -118,27 +121,87 @@ class BlueWhaleDetector:
             visible_frames=self._visible_frames,
         )
 
+    def _color_score(
+        self,
+        blue: np.ndarray,
+        green: np.ndarray,
+        red: np.ndarray,
+    ) -> np.ndarray:
+        if self.color == "blue":
+            return (blue + green) / 2.0 - red
+        return (red + green) / 2.0 - blue
+
+    def _color_mask(
+        self,
+        image: np.ndarray,
+        color_score: np.ndarray,
+        brightness: np.ndarray,
+    ) -> np.ndarray:
+        if self.color == "blue":
+            return (color_score >= self.minimum_color_score) & (brightness >= 125.0)
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        hue, saturation, value = cv2.split(hsv)
+        return (
+            (color_score >= self.minimum_color_score)
+            & (hue >= 10)
+            & (hue <= 38)
+            & (saturation >= 50)
+            & (value >= 140)
+        )
+
+
+class BlueWhaleDetector(ColorWhaleDetector):
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(color="blue", **kwargs)
+
+
+class YellowWhaleDetector(ColorWhaleDetector):
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(color="yellow", minimum_color_score=18.0, **kwargs)
+
 
 def annotate(frame: CameraFrame, target: BlueWhaleObservation | None) -> bytes:
+    return annotate_whales(frame, {"blue": target}, selected_color="blue")
+
+
+def annotate_whales(
+    frame: CameraFrame,
+    targets: dict[str, BlueWhaleObservation | None],
+    *,
+    selected_color: str,
+) -> bytes:
     image = frame.bgr.copy()
-    if target is not None:
+    palette = {"blue": (255, 255, 0), "yellow": (0, 220, 255)}
+    for color, target in targets.items():
+        if target is None:
+            continue
         x, y, width, height = target.bbox_xywh
-        cv2.rectangle(image, (x, y), (x + width, y + height), (255, 255, 0), 3)
+        box_color = palette.get(color, (255, 255, 255))
+        thickness = 5 if color == selected_color else 2
+        cv2.rectangle(
+            image,
+            (x, y),
+            (x + width, y + height),
+            box_color,
+            thickness,
+        )
         cv2.circle(image, target.center, 5, (0, 255, 0), -1)
+        prefix = "SELECTED " if color == selected_color else ""
         cv2.putText(
             image,
-            f"BLUE WHALE {target.confidence:.2f} stable:{target.visible_frames}",
+            f"{prefix}{color.upper()} WHALE {target.confidence:.2f} stable:{target.visible_frames}",
             (max(8, x), max(24, y - 9)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
-            (255, 255, 0),
+            box_color,
             2,
             cv2.LINE_AA,
         )
-    else:
+    selected = targets.get(selected_color)
+    if selected is None:
         cv2.putText(
             image,
-            "BLUE WHALE NOT FOUND - MOTION ZERO",
+            f"SELECTED {selected_color.upper()} WHALE NOT FOUND - MOTION ZERO",
             (20, 42),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,

@@ -8,7 +8,7 @@ import uvicorn
 from .app import create_app
 from .camera import create_camera
 from .controller import ApproachConfig, ApproachController
-from .detector import BlueWhaleDetector
+from .detector import BlueWhaleDetector, YellowWhaleDetector
 from .fruit import FruitDetector
 from .motion import MotionConfig, create_motion, initialize_dds
 from .runtime import CollieRuntime
@@ -50,6 +50,7 @@ def build_runtime() -> CollieRuntime:
     return CollieRuntime(
         camera=create_camera(),
         detector=BlueWhaleDetector(),
+        yellow_detector=YellowWhaleDetector(),
         controller=ApproachController(controller_config),
         motion=motion,
         motion_enabled=motion_enabled,

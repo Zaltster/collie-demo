@@ -25,6 +25,7 @@ class CenteredWhaleCamera:
         self.frame_id += 1
         image = np.full((720, 1280, 3), 235, dtype=np.uint8)
         cv2.ellipse(image, (640, 650), (34, 42), 0, 0, 360, (245, 245, 160), -1)
+        cv2.ellipse(image, (900, 650), (52, 34), 0, 0, 360, (70, 220, 235), -1)
         return CameraFrame(self.frame_id, time.monotonic(), image)
 
 
@@ -75,6 +76,29 @@ def test_runtime_requires_confirmation_then_pulses_forward() -> None:
             assert avoidance.moves[-1] == (0.08, 0.0, 0.0)
             assert status["produce"]["detections"][0]["label"] == "apple"
             assert status["produce"]["inference_ms"] is not None
+            assert status["selected_target_color"] == "blue"
+            assert status["whales"]["blue"] is not None
+            assert status["whales"]["yellow"] is not None
+
+            selected = await runtime.select_target("yellow")
+            assert selected["selected_target_color"] == "yellow"
+            assert selected["selected_whale"] is not None
+            assert selected["armed"] is False
+            assert selected["command"]["reason"] == "yellow_whale_selected"
+
+            await runtime.arm(ARM_CONFIRMATION)
+            yellow_status = await runtime.pulse()
+            assert yellow_status["armed"] is True
+            assert yellow_status["command"]["reason"] == "curving_to_selected_whale"
+            assert avoidance.moves[-1][0] == 0.08
+            assert avoidance.moves[-1][2] < 0.0
+
+            try:
+                await runtime.select_target("purple")
+            except RuntimeCommandError:
+                pass
+            else:
+                raise AssertionError("invalid target color was accepted")
         finally:
             await runtime.close()
 

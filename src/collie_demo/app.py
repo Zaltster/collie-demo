@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
@@ -15,6 +16,11 @@ class ArmRequest(BaseModel):
     confirmation: str
 
 
+class TargetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    color: Literal["blue", "yellow"]
+
+
 def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -24,7 +30,7 @@ def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
         finally:
             await runtime.close()
 
-    app = FastAPI(title="Collie blue-whale demo", version="1", lifespan=lifespan)
+    app = FastAPI(title="Collie color-whale demo", version="1", lifespan=lifespan)
 
     @app.get("/")
     def index() -> FileResponse:
@@ -48,6 +54,13 @@ def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
         except RuntimeCommandError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/target")
+    async def target(request: TargetRequest) -> dict[str, object]:
+        try:
+            return await runtime.select_target(request.color)
+        except RuntimeCommandError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post("/api/pulse")
     async def pulse() -> dict[str, object]:
         try:
@@ -60,4 +73,3 @@ def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
         return await runtime.stop()
 
     return app
-

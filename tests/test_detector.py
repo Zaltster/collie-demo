@@ -3,7 +3,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from collie_demo.detector import BlueWhaleDetector
+from collie_demo.detector import BlueWhaleDetector, YellowWhaleDetector
 from collie_demo.types import CameraFrame
 
 
@@ -11,6 +11,12 @@ def whale_frame(frame_id: int = 1) -> CameraFrame:
     image = np.full((720, 1280, 3), 235, dtype=np.uint8)
     cv2.ellipse(image, (840, 650), (34, 42), 0, 0, 360, (245, 245, 160), -1)
     cv2.ellipse(image, (840, 694), (31, 7), 0, 0, 360, (75, 75, 75), -1)
+    return CameraFrame(frame_id, float(frame_id), image)
+
+
+def yellow_whale_frame(frame_id: int = 1) -> CameraFrame:
+    image = np.full((720, 1280, 3), 80, dtype=np.uint8)
+    cv2.ellipse(image, (760, 650), (52, 34), 0, 0, 360, (70, 220, 235), -1)
     return CameraFrame(frame_id, float(frame_id), image)
 
 
@@ -33,6 +39,20 @@ def test_stability_increases_across_nearby_frames() -> None:
 def test_nonblue_floor_does_not_detect() -> None:
     image = np.full((720, 1280, 3), 235, dtype=np.uint8)
     assert BlueWhaleDetector().detect(CameraFrame(1, 1.0, image)) is None
+
+
+def test_detects_yellow_whale_without_confusing_it_for_blue() -> None:
+    frame = yellow_whale_frame()
+    yellow = YellowWhaleDetector().detect(frame)
+
+    assert yellow is not None
+    assert abs(yellow.center[0] - 760) < 8
+    assert yellow.confidence > 0.5
+    assert BlueWhaleDetector().detect(frame) is None
+
+
+def test_yellow_detector_ignores_blue_whale() -> None:
+    assert YellowWhaleDetector().detect(whale_frame()) is None
 
 
 def test_detects_blue_whale_on_left_side_of_floor() -> None:

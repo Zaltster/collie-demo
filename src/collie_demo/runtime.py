@@ -6,7 +6,7 @@ import time
 from typing import Protocol
 
 from .controller import ApproachController
-from .detector import BlueWhaleDetector, annotate
+from .detector import BlueWhaleDetector, YellowWhaleDetector, annotate_whales
 from .fruit import FruitDetection, annotate_fruits
 from .motion import MotionError, MotionNotReady, UnitreeMotionAdapter
 from .types import BlueWhaleObservation, CameraFrame, VelocityCommand
@@ -37,6 +37,7 @@ class CollieRuntime:
         *,
         camera: CameraProtocol,
         detector: BlueWhaleDetector,
+        yellow_detector: YellowWhaleDetector | None = None,
         controller: ApproachController,
         motion: UnitreeMotionAdapter | None,
         motion_enabled: bool,
@@ -45,7 +46,10 @@ class CollieRuntime:
         loop_hz: float = 8.0,
     ) -> None:
         self.camera = camera
-        self.detector = detector
+        self.detectors = {
+            "blue": detector,
+            "yellow": yellow_detector or YellowWhaleDetector(),
+        }
         self.controller = controller
         self.motion = motion
         self.motion_enabled = bool(motion_enabled)
@@ -59,6 +63,10 @@ class CollieRuntime:
         self._closing = False
         self._jpeg: bytes | None = None
         self._latest_frame: CameraFrame | None = None
+        self._selected_color = "blue"
+        self._targets: dict[str, BlueWhaleObservation | None] = {
+            color: None for color in self.detectors
+        }
         self._target: BlueWhaleObservation | None = None
         self._produce_detections: list[FruitDetection] = []
         self._produce_frame_id: int | None = None
@@ -113,8 +121,11 @@ class CollieRuntime:
                 raise RuntimeCommandError("unranged demo motion is disabled")
             async with self._state_lock:
                 target = self._target
+                selected_color = self._selected_color
             if target is None or target.visible_frames < self.controller.config.stable_frames_required:
-                raise RuntimeCommandError("blue whale is not stably detected")
+                raise RuntimeCommandError(
+                    f"{selected_color} whale is not stably detected"
+                )
             try:
                 lease = await self.motion.arm()
             except MotionError as exc:
@@ -123,6 +134,25 @@ class CollieRuntime:
             self._last_pulse_at = None
             self._forward_elapsed_s = 0.0
             self._command = VelocityCommand(reason="armed_waiting_for_hold")
+            return await self.status()
+
+    async def select_target(self, color: str) -> dict[str, object]:
+        normalized = color.strip().lower()
+        if normalized not in self.detectors:
+            choices = ", ".join(sorted(self.detectors))
+            raise RuntimeCommandError(f"target must be one of: {choices}")
+        async with self._action_lock:
+            if self.motion is not None and (
+                self._lease is not None or self.motion.armed
+            ):
+                await self.motion.emergency_stop()
+            self._lease = None
+            self._last_pulse_at = None
+            self._forward_elapsed_s = 0.0
+            self._command = VelocityCommand(reason=f"{normalized}_whale_selected")
+            async with self._state_lock:
+                self._selected_color = normalized
+                self._target = self._targets.get(normalized)
             return await self.status()
 
     async def pulse(self) -> dict[str, object]:
@@ -144,9 +174,9 @@ class CollieRuntime:
                 allow_unranged_forward=self.allow_unranged_forward,
             )
             unsafe_reasons = {
-                "blue_whale_not_found",
-                "blue_whale_not_stable",
-                "blue_whale_stale",
+                "selected_whale_not_found",
+                "selected_whale_not_stable",
+                "selected_whale_stale",
                 "frame_geometry_missing",
                 "unranged_forward_disabled",
                 "forward_budget_complete",
@@ -181,6 +211,12 @@ class CollieRuntime:
             now = time.monotonic()
             frame_age = None if self._last_frame_at is None else now - self._last_frame_at
             target_age = None if self._target is None else now - self._target.captured_monotonic_s
+            target_ages = {
+                color: None
+                if target is None
+                else round(now - target.captured_monotonic_s, 3)
+                for color, target in self._targets.items()
+            }
             produce_age = (
                 None if self._produce_last_at is None else now - self._produce_last_at
             )
@@ -190,8 +226,24 @@ class CollieRuntime:
                 "frame_count": self._frame_count,
                 "frame_age_s": None if frame_age is None else round(frame_age, 3),
                 "last_error": self._last_error,
-                "blue_whale": None if target is None else target.to_dict(),
-                "blue_whale_age_s": None if target_age is None else round(target_age, 3),
+                "selected_target_color": self._selected_color,
+                "selected_whale": None if target is None else target.to_dict(),
+                "selected_whale_age_s": None
+                if target_age is None
+                else round(target_age, 3),
+                "whales": {
+                    color: None if item is None else item.to_dict()
+                    for color, item in self._targets.items()
+                },
+                "whale_ages_s": target_ages,
+                "blue_whale": None
+                if self._targets.get("blue") is None
+                else self._targets["blue"].to_dict(),
+                "blue_whale_age_s": target_ages.get("blue"),
+                "yellow_whale": None
+                if self._targets.get("yellow") is None
+                else self._targets["yellow"].to_dict(),
+                "yellow_whale_age_s": target_ages.get("yellow"),
                 "produce": None
                 if self.produce_detector is None
                 else {
@@ -225,35 +277,48 @@ class CollieRuntime:
             lost_while_armed = False
             try:
                 frame = await asyncio.to_thread(self.camera.read)
-                target = self.detector.detect(frame)
+                targets = {
+                    color: detector.detect(frame)
+                    for color, detector in self.detectors.items()
+                }
                 async with self._state_lock:
                     self._latest_frame = frame
                     produce_detections = list(self._produce_detections)
+                    selected_color = self._selected_color
                 produce_image = annotate_fruits(frame.bgr, produce_detections)
                 annotated_frame = CameraFrame(
                     frame.frame_id, frame.captured_monotonic_s, produce_image
                 )
-                jpeg = annotate(annotated_frame, target)
+                jpeg = annotate_whales(
+                    annotated_frame,
+                    targets,
+                    selected_color=selected_color,
+                )
                 async with self._state_lock:
+                    selected_color = self._selected_color
+                    selected_target = targets.get(selected_color)
                     self._jpeg = jpeg
-                    self._target = target
+                    self._targets = targets
+                    self._target = selected_target
                     self._frame_width = frame.width
                     self._frame_count += 1
                     self._last_frame_at = time.monotonic()
                     self._last_error = ""
                 lost_while_armed = self._lease is not None and (
-                    target is None
-                    or target.visible_frames < self.controller.config.stable_frames_required
+                    selected_target is None
+                    or selected_target.visible_frames
+                    < self.controller.config.stable_frames_required
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 async with self._state_lock:
+                    self._targets = {color: None for color in self.detectors}
                     self._target = None
                     self._last_error = str(exc)
                 lost_while_armed = self._lease is not None
             if lost_while_armed:
-                await self.stop("blue_whale_lost")
+                await self.stop("selected_whale_lost")
             await asyncio.sleep(max(0.0, period - (time.monotonic() - started)))
 
     async def _produce_loop(self) -> None:
