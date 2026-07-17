@@ -1,8 +1,9 @@
 # Collie Demo
 
-A self-contained Wendy app for Woof that lets an operator select any locally
-detected fruit and safely follow that exact object. It uses the SnapStock
-YOLOv8m fruit and vegetable detector.
+A self-contained Wendy app for Woof that lets an operator select a locally
+detected apple, banana, or pear and safely follow that exact object. It uses a
+YOLOE-11m checkpoint whose visual prompt embeddings were baked from the three
+physical stage props.
 Frames come directly from Unitree's public `VideoClient`; inference,
 annotation, motion supervision, and the browser UI all run locally in the
 robot container. No Roboflow service, hosted inference API, Hugging Face key,
@@ -10,21 +11,19 @@ or internet connection is used at runtime.
 
 ## Current behavior
 
-- Loads `models/snapstock/fruit_vegetable_yolov8m.pt` locally.
-- Detects all 63 classes stored in that checkpoint.
+- Loads `models/collie/collie-fruit-yoloe11m.pt` locally.
+- Detects only the three visual-prompt classes: apple, banana, and pear.
 - Draws labels, confidence scores, bounding boxes, and box centers.
 - Prints every detection to the container log.
 - Serves the annotated Go2 camera and structured detections on port 8096.
-- Uses a 50% confidence threshold by default.
+- Uses tested per-class thresholds: apple 80%, banana 70%, and pear 80%.
 - Makes every live detection selectable. Selection sends both the model class
   and bounding-box center, so either of two visible apples can be selected
   independently; one click on `Follow Selected Fruit` then starts the guarded
   approach loop.
-- Uses YOLO to recognize the selected fruit, then follows only that exact box
-  with a fast camera-loop MIL tracker so motion never steers from the
-  several-seconds-old inference frame.
-- Keeps the tracker's latest center as the reacquisition hint when another YOLO
-  result arrives.
+- Uses each fresh GPU YOLO result as the authoritative target observation and
+  collapses overlapping same-class boxes before they reach the UI or control
+  loop.
 - Revalidates the selected track against every new YOLO result. If the chosen
   fruit disappears or the tracker drifts to a different object for three
   consecutive results, selection is cleared and motion is stopped. One or two
@@ -58,17 +57,29 @@ Whale color detection and whale motion targets have been removed.
 
 ## Model
 
-Download the weight before building:
+Download the official YOLOE base checkpoint, capture a clean reference frame,
+and bake the three exact props into a self-contained local checkpoint:
 
 ```sh
-mkdir -p models/snapstock
+mkdir -p models/candidates models/collie
 curl -L --fail \
-  "https://huggingface.co/Senu-12/snapstock-fruit-vegetable-detector/resolve/main/yolov8/fruit_vegetable_yolov8m.pt?download=true" \
-  -o models/snapstock/fruit_vegetable_yolov8m.pt
+  "https://github.com/ultralytics/assets/releases/download/v8.4.0/yoloe-11m-seg.pt" \
+  -o models/candidates/yoloe-11m-seg.pt
+
+python tools/build_visual_prompt_weights.py \
+  --weights models/candidates/yoloe-11m-seg.pt \
+  --reference captures/three-fruit-benchmark/raw/frame_000.jpg \
+  --output models/collie/collie-fruit-yoloe11m.pt \
+  --device mps \
+  --prompt apple=1542,758,1596,817 \
+  --prompt banana=1186,779,1262,844 \
+  --prompt pear=812,775,884,855
 ```
 
-The expected size is 52,089,985 bytes. Model files are excluded from Git but
-the Docker build context includes this exact weight.
+The current baked checkpoint is 59,997,395 bytes with SHA-256
+`7c75fcc5d449a8b00785dfd0c955cbf11bd6bde6a5ede1ea8d34c097413bc53e`.
+Model files and camera captures are excluded from Git, but the Docker build
+context includes the baked checkpoint.
 
 ## Local test
 
@@ -83,16 +94,16 @@ Run on a Mac camera after granting camera permission:
 
 ```sh
 collie-fruit-webcam \
-  --model models/snapstock/fruit_vegetable_yolov8m.pt \
+  --model models/collie/collie-fruit-yoloe11m.pt \
   --camera 0 \
-  --confidence 0.5
+  --confidence 0.7
 ```
 
 Run the browser UI against a JPEG source:
 
 ```sh
 collie-fruit-ui \
-  --model models/snapstock/fruit_vegetable_yolov8m.pt \
+  --model models/collie/collie-fruit-yoloe11m.pt \
   --source http://woof.local:8096/camera.jpg \
   --port 8097
 ```
@@ -114,9 +125,22 @@ curl http://woof.local:8096/api/status
 ```
 
 Then open `http://woof.local:8096/`. A healthy status response must report the
-SnapStock model path, all 63 classes under `produce`, the selected fruit and
-its current tracker observation, `produce.device.resolved: "cuda:0"`, motion
-state, and `ok: true`.
+Collie YOLOE model path, `produce.class_thresholds` of `apple: 0.8`,
+`banana: 0.7`, and `pear: 0.8`, the selected fruit and its current observation,
+`produce.device.resolved: "cuda:0"`, motion state, and `ok: true`. In this
+stage configuration the model only returns apple, banana, and pear detections.
+
+The raw, unannotated camera frame is available at `/camera-raw.jpg` for
+repeatable detector evaluation. The fixed-scene benchmark used to tune the
+three thresholds can be rerun with:
+
+```sh
+python tools/benchmark_fruit_models.py \
+  models/collie/collie-fruit-yoloe11m.pt \
+  --source captures/three-fruit-benchmark/raw \
+  --device mps \
+  --output captures/three-fruit-benchmark/results/collie-yoloe.json
+```
 
 The stage control sequence is: click `Select` beside the exact fruit, wait for
 the Follow button to enable, then click `Follow Selected Fruit` once. `STOP

@@ -8,3 +8,6 @@ models/*
 !models/snapstock/
 models/snapstock/*
 !models/snapstock/fruit_vegetable_yolov8m.pt
+!models/collie/
+models/collie/*
+!models/collie/collie-fruit-yoloe11m.pt

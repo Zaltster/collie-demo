@@ -24,12 +24,18 @@ class ArrayValue:
 
 
 class FakeBoxes:
-    xyxy = ArrayValue([[10.2, 20.4, 50.8, 80.6]])
-    conf = ArrayValue([0.91234])
-    cls = ArrayValue([2])
+    xyxy = ArrayValue(
+        [
+            [10.2, 20.4, 50.8, 80.6],
+            [12.0, 22.0, 49.0, 79.0],
+            [60.0, 20.0, 90.0, 80.0],
+        ]
+    )
+    conf = ArrayValue([0.91234, 0.8, 0.25])
+    cls = ArrayValue([2, 2, 2])
 
     def __len__(self) -> int:
-        return 1
+        return 3
 
 
 class FakeResult:
@@ -75,6 +81,28 @@ def test_fruit_detector_returns_label_confidence_box_and_center(tmp_path: Path) 
     assert model.last_predict_options["device"] == "cuda:0"
     assert detector.device_status()["requested"] == "cuda:0"
     assert np.any(annotate_fruits(frame, detections) != frame)
+
+
+def test_fruit_detector_applies_per_class_threshold_before_returning(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "fruit.pt"
+    model_path.write_bytes(b"test")
+    model = FakeModel()
+    detector = FruitDetector(
+        model_path,
+        confidence=0.5,
+        class_thresholds={"banana": 0.3},
+        model=model,
+    )
+
+    detections = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))
+
+    assert [detection.confidence for detection in detections] == [0.9123]
+    assert detector.confidence == 0.3
+    assert detector.class_thresholds == {"banana": 0.3}
+    assert model.last_predict_options["conf"] == 0.3
+    assert model.last_predict_options["classes"] == [2]
 
 
 def test_unitree_frame_source_returns_video_client_bgr() -> None:

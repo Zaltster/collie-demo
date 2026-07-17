@@ -21,6 +21,12 @@ class FakeRuntime:
     async def status(self) -> dict[str, object]:
         return {"selected_target_name": self.selected}
 
+    async def jpeg(self) -> bytes:
+        return b"annotated-jpeg"
+
+    async def raw_jpeg(self) -> bytes:
+        return b"raw-jpeg"
+
     async def select_target(
         self, target: str, center: tuple[int, int] | None = None
     ) -> dict[str, object]:
@@ -58,3 +64,5 @@ def test_target_endpoint_selects_a_specific_detection(tmp_path: Path) -> None:
         )
         assert follow.status_code == 200
         assert follow.json()["follow_active"] is True
+        assert client.get("/camera.jpg").content == b"annotated-jpeg"
+        assert client.get("/camera-raw.jpg").content == b"raw-jpeg"

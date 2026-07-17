@@ -37,6 +37,7 @@ class FruitDetector:
         model_path: str | Path,
         *,
         confidence: float = 0.5,
+        class_thresholds: dict[str, float] | None = None,
         device: str | int | None = None,
         model: Any | None = None,
     ) -> None:
@@ -45,7 +46,18 @@ class FruitDetector:
             raise FileNotFoundError(f"fruit model not found: {self.model_path}")
         if not 0.0 < confidence <= 1.0:
             raise ValueError("confidence must be in (0, 1]")
-        self.confidence = float(confidence)
+        normalized_thresholds: dict[str, float] = {}
+        for label, threshold in (class_thresholds or {}).items():
+            normalized_label = label.casefold().strip()
+            if not normalized_label:
+                raise ValueError("class threshold labels cannot be empty")
+            if not 0.0 < threshold <= 1.0:
+                raise ValueError("class thresholds must be in (0, 1]")
+            normalized_thresholds[normalized_label] = float(threshold)
+        self.class_thresholds = normalized_thresholds
+        self.confidence = min(
+            [float(confidence), *normalized_thresholds.values()]
+        )
         self.requested_device = device
         if model is None:
             from ultralytics import YOLO
@@ -59,6 +71,18 @@ class FruitDetector:
                 names.items() if isinstance(names, dict) else enumerate(names)
             )
         }
+        self.class_ids = [
+            class_id
+            for class_id, label in self.names.items()
+            if not self.class_thresholds
+            or label.casefold().strip() in self.class_thresholds
+        ]
+        missing_labels = set(self.class_thresholds) - {
+            label.casefold().strip() for label in self.names.values()
+        }
+        if missing_labels:
+            rendered = ", ".join(sorted(missing_labels))
+            raise ValueError(f"class thresholds not present in model: {rendered}")
 
     def detect(self, bgr: NDArray[np.uint8]) -> list[FruitDetection]:
         predict_options: dict[str, object] = {
@@ -68,6 +92,8 @@ class FruitDetector:
         }
         if self.requested_device is not None:
             predict_options["device"] = self.requested_device
+        if self.class_thresholds:
+            predict_options["classes"] = self.class_ids
         results = self.model.predict(**predict_options)
         if not results:
             return []
@@ -81,16 +107,22 @@ class FruitDetector:
         for coordinates, score, class_number in zip(xyxy, confidences, classes):
             x1, y1, x2, y2 = (int(round(float(value))) for value in coordinates)
             class_id = int(class_number)
+            label = self.names.get(class_id, f"class_{class_id}")
+            threshold = self.class_thresholds.get(
+                label.casefold().strip(), self.confidence
+            )
+            if float(score) < threshold:
+                continue
             detections.append(
                 FruitDetection(
                     class_id=class_id,
-                    label=self.names.get(class_id, f"class_{class_id}"),
+                    label=label,
                     confidence=round(float(score), 4),
                     bbox_xyxy=(x1, y1, x2, y2),
                     center=((x1 + x2) // 2, (y1 + y2) // 2),
                 )
             )
-        return detections
+        return _suppress_overlapping_detections(detections)
 
     def device_status(self) -> dict[str, object]:
         try:
@@ -199,6 +231,39 @@ def _as_numpy(value: Any) -> NDArray[np.float32]:
     if hasattr(value, "numpy"):
         value = value.numpy()
     return np.asarray(value)
+
+
+def _suppress_overlapping_detections(
+    detections: list[FruitDetection], iou_threshold: float = 0.35
+) -> list[FruitDetection]:
+    """Keep the best same-class box for one physical object."""
+    accepted: list[FruitDetection] = []
+    for candidate in sorted(
+        detections, key=lambda detection: detection.confidence, reverse=True
+    ):
+        if any(
+            existing.label.casefold() == candidate.label.casefold()
+            and _box_iou(existing.bbox_xyxy, candidate.bbox_xyxy) >= iou_threshold
+            for existing in accepted
+        ):
+            continue
+        accepted.append(candidate)
+    return accepted
+
+
+def _box_iou(
+    first: tuple[int, int, int, int], second: tuple[int, int, int, int]
+) -> float:
+    left = max(first[0], second[0])
+    top = max(first[1], second[1])
+    right = min(first[2], second[2])
+    bottom = min(first[3], second[3])
+    intersection = max(0, right - left) * max(0, bottom - top)
+    if intersection == 0:
+        return 0.0
+    first_area = max(0, first[2] - first[0]) * max(0, first[3] - first[1])
+    second_area = max(0, second[2] - second[0]) * max(0, second[3] - second[1])
+    return intersection / (first_area + second_area - intersection)
 
 
 def _class_color(class_id: int) -> tuple[int, int, int]:

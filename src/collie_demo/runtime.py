@@ -23,6 +23,7 @@ class CameraProtocol(Protocol):
 class ProduceDetectorProtocol(Protocol):
     model_path: Path
     confidence: float
+    class_thresholds: dict[str, float]
     names: dict[int, str]
 
     def detect(self, bgr: object) -> list[FruitDetection]: ...
@@ -356,6 +357,22 @@ class CollieRuntime:
         async with self._state_lock:
             return self._jpeg
 
+    async def raw_jpeg(self) -> bytes | None:
+        """Return the latest unannotated frame for evaluation and capture."""
+        async with self._state_lock:
+            frame = self._latest_frame
+        if frame is None:
+            return None
+        encoded_ok, encoded = await asyncio.to_thread(
+            cv2.imencode,
+            ".jpg",
+            frame.bgr,
+            [cv2.IMWRITE_JPEG_QUALITY, 95],
+        )
+        if not encoded_ok:
+            raise RuntimeError("could not encode raw camera frame")
+        return encoded.tobytes()
+
     async def status(self) -> dict[str, object]:
         async with self._state_lock:
             now = time.monotonic()
@@ -423,6 +440,9 @@ class CollieRuntime:
                 else {
                     "model_path": str(self.produce_detector.model_path),
                     "confidence_threshold": self.produce_detector.confidence,
+                    "class_thresholds": getattr(
+                        self.produce_detector, "class_thresholds", {}
+                    ),
                     "classes": self.produce_detector.names,
                     "detections": [item.to_dict() for item in self._produce_detections],
                     "frame_id": self._produce_frame_id,

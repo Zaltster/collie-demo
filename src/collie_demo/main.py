@@ -21,6 +21,19 @@ def env_bool(name: str, default: bool = False) -> bool:
     }
 
 
+def env_class_thresholds(name: str) -> dict[str, float]:
+    rendered = os.environ.get(name, "").strip()
+    if not rendered:
+        return {}
+    thresholds: dict[str, float] = {}
+    for item in rendered.split(","):
+        label, separator, value = item.partition("=")
+        if not separator or not label.strip() or not value.strip():
+            raise ValueError(f"{name} must use label=value pairs")
+        thresholds[label.strip()] = float(value)
+    return thresholds
+
+
 def build_runtime() -> CollieRuntime:
     network_interface = os.environ.get("GO2_NETWORK_INTERFACE", "").strip() or None
     motion_enabled = env_bool("COLLIE_MOTION_ENABLED")
@@ -56,6 +69,9 @@ def build_runtime() -> CollieRuntime:
         produce_detector=FruitDetector(
             produce_model,
             confidence=float(os.environ.get("COLLIE_PRODUCE_CONFIDENCE", "0.5")),
+            class_thresholds=env_class_thresholds(
+                "COLLIE_PRODUCE_CLASS_THRESHOLDS"
+            ),
             device=os.environ.get("COLLIE_INFERENCE_DEVICE", "").strip() or None,
         ),
         produce_revalidation_misses_required=int(

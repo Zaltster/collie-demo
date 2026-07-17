@@ -47,6 +47,13 @@ def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
             raise HTTPException(status_code=503, detail="no camera frame yet")
         return Response(jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
+    @app.get("/camera-raw.jpg")
+    async def raw_camera() -> Response:
+        jpeg = await runtime.raw_jpeg()
+        if jpeg is None:
+            raise HTTPException(status_code=503, detail="no camera frame yet")
+        return Response(jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
     @app.post("/api/arm")
     async def arm(request: ArmRequest) -> dict[str, object]:
         try:

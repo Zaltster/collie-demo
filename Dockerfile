@@ -27,9 +27,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV CYCLONEDDS_HOME=/usr/local
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
-COPY src/ src/
-RUN python -m venv /opt/collie-venv \
+COPY pyproject.toml ./
+RUN mkdir -p src/collie_demo && touch src/collie_demo/__init__.py \
+    && python -m venv /opt/collie-venv \
     && /opt/collie-venv/bin/python -m pip install --no-cache-dir --upgrade pip \
     && /opt/collie-venv/bin/python -m pip install --no-cache-dir \
       --index-url https://download.pytorch.org/whl/cpu \
@@ -37,6 +37,8 @@ RUN python -m venv /opt/collie-venv \
     && /opt/collie-venv/bin/python -m pip install --no-cache-dir --no-deps \
       "git+https://github.com/unitreerobotics/unitree_sdk2_python.git@${UNITREE_SDK2_PYTHON_REF}" \
     && /opt/collie-venv/bin/python -m pip install --no-cache-dir '.[robot,fruit]'
+COPY src/ src/
+RUN /opt/collie-venv/bin/python -m pip install --no-cache-dir --no-deps .
 
 FROM python:3.11-slim-bookworm AS runtime-generic
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -75,13 +77,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /tmp/cyclonedds /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
-COPY src/ src/
-RUN python3 -m pip install --no-cache-dir --upgrade pip \
+COPY pyproject.toml ./
+RUN mkdir -p src/collie_demo && touch src/collie_demo/__init__.py \
+    && python3 -m pip install --no-cache-dir --upgrade pip \
     && python3 -m pip install --no-cache-dir --no-deps \
       "git+https://github.com/unitreerobotics/unitree_sdk2_python.git@${UNITREE_SDK2_PYTHON_REF}" \
     && python3 -m pip install --no-cache-dir '.[robot,fruit]' \
     && python3 -c "import torch; assert torch.version.cuda; print('CUDA torch', torch.__version__, torch.version.cuda)"
+COPY src/ src/
+RUN python3 -m pip install --no-cache-dir --no-deps .
 
 # ── Woof final image ────────────────────────────────────────────────────────
 # Woof's current Wendy agent reports an empty deviceType even though it exposes
@@ -107,8 +111,9 @@ ENV WENDY_PLATFORM=nvidia-jetson \
     COLLIE_PORT=8096 \
     COLLIE_MOTION_ENABLED=1 \
     COLLIE_ALLOW_UNRANGED_DEMO=1 \
-    COLLIE_PRODUCE_MODEL=/app/models/snapstock/fruit_vegetable_yolov8m.pt \
-    COLLIE_PRODUCE_CONFIDENCE=0.5 \
+    COLLIE_PRODUCE_MODEL=/app/models/collie/collie-fruit-yoloe11m.pt \
+    COLLIE_PRODUCE_CONFIDENCE=0.8 \
+    COLLIE_PRODUCE_CLASS_THRESHOLDS="apple=0.80,banana=0.70,pear=0.80" \
     COLLIE_REVALIDATION_MISSES=3 \
     COLLIE_MAX_PRODUCE_AGE_S=0.75 \
     COLLIE_STABLE_FRAMES=3 \
@@ -121,7 +126,7 @@ ENV WENDY_PLATFORM=nvidia-jetson \
 
 WORKDIR /app
 COPY web/ web/
-COPY models/snapstock/fruit_vegetable_yolov8m.pt models/snapstock/fruit_vegetable_yolov8m.pt
+COPY models/collie/collie-fruit-yoloe11m.pt models/collie/collie-fruit-yoloe11m.pt
 
 EXPOSE 8096
 CMD ["python3", "-m", "collie_demo.supervisor"]
