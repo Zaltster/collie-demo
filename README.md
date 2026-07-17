@@ -16,21 +16,30 @@ or internet connection is used at runtime.
 - Prints every detection to the container log.
 - Serves the annotated Go2 camera and structured detections on port 8096.
 - Uses a 50% confidence threshold by default.
-- Adds a `Follow` button to every live detection. The button sends both the
-  model class and bounding-box center, so either of two visible apples can be
-  selected independently.
+- Makes every live detection selectable. Selection sends both the model class
+  and bounding-box center, so either of two visible apples can be selected
+  independently; one click on `Follow Selected Fruit` then starts the guarded
+  approach loop.
 - Uses YOLO to recognize the selected fruit, then follows only that exact box
   with a fast camera-loop MIL tracker so motion never steers from the
   several-seconds-old inference frame.
 - Keeps the tracker's latest center as the reacquisition hint when another YOLO
   result arrives.
+- Revalidates the selected track against every new YOLO result. If the chosen
+  fruit disappears or the tracker drifts to a different object, selection is
+  cleared and motion is stopped instead of displaying a stale target.
+- Marks tracker-only frames honestly in the UI instead of repeating an old
+  YOLO confidence score as though it were current.
 - Continuously steers from the latest observation of the selected object.
 - Disarms whenever the selected object changes, so changing targets cannot
   redirect an active motion burst.
 - Runs produce inference in a separate worker so a slow YOLO frame cannot
   block hold pulses, stop commands, or the independent motion watchdog.
-- Keeps the exact arm confirmation, press-and-hold control, factory avoidance,
+- Keeps the exact arm confirmation, dedicated stop control, factory avoidance,
   forward time budget, target-loss stop, and `StopMove` safety boundary.
+- Uses Woof's Jetson GPU for YOLO inference and reports the requested/resolved
+  device, CUDA version, Torch version, and current inference latency in
+  `/api/status`.
 
 Every class emitted by the local model is selectable from the detection list.
 Whale color detection and whale motion targets have been removed.
@@ -94,4 +103,5 @@ curl http://woof.local:8096/api/status
 
 Then open `http://woof.local:8096/`. A healthy status response must report the
 SnapStock model path, all 63 classes under `produce`, the selected fruit and
-its current tracker observation, motion state, and `ok: true`.
+its current tracker observation, `produce.device.resolved: "cuda:0"`, motion
+state, and `ok: true`.

@@ -63,6 +63,14 @@ class FakeProduceDetector:
         ]
 
 
+class ToggleProduceDetector(FakeProduceDetector):
+    def __init__(self) -> None:
+        self.visible = True
+
+    def detect(self, image: object) -> list[FruitDetection]:
+        return super().detect(image) if self.visible else []
+
+
 class FakeProduceTracker:
     def __init__(self, bbox: tuple[int, int, int, int]) -> None:
         self.bbox = bbox
@@ -142,6 +150,50 @@ def test_runtime_requires_confirmation_then_pulses_forward() -> None:
                 pass
             else:
                 raise AssertionError("invalid target color was accepted")
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_yolo_miss_clears_selected_tracker() -> None:
+    async def scenario() -> None:
+        detector = ToggleProduceDetector()
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(),
+            motion=None,
+            motion_enabled=False,
+            allow_unranged_forward=True,
+            produce_detector=detector,
+            produce_tracker_factory=fake_tracker_factory,
+            loop_hz=60.0,
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                status = await runtime.status()
+                if status["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("produce detector never returned a frame")
+
+            selected = await runtime.select_target("banana", (350, 240))
+            assert selected["selected_target_name"] == "banana"
+            detector.visible = False
+
+            for _ in range(100):
+                status = await runtime.status()
+                if status["selected_target_name"] is None:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("missing banana remained selected")
+
+            assert status["selected_target"] is None
+            assert status["produce"]["tracker"]["label"] is None
+            assert status["command"]["reason"] == "selected_target_not_revalidated"
         finally:
             await runtime.close()
 

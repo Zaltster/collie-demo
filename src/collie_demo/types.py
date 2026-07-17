@@ -27,7 +27,7 @@ class TargetObservation:
     captured_monotonic_s: float
     bbox_xywh: tuple[int, int, int, int]
     center: tuple[int, int]
-    confidence: float
+    confidence: float | None
     visible_frames: int
 
     def to_dict(self) -> dict[str, object]:

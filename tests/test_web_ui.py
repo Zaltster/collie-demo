@@ -36,3 +36,11 @@ def test_camera_refresh_does_not_cancel_an_inflight_image() -> None:
     assert "if(refreshInFlight)return" in html
     assert "if(camera.complete)camera.src=" in html
     assert "finally{refreshInFlight=false}" in html
+
+
+def test_tracker_confidence_is_not_presented_as_live_yolo_confidence() -> None:
+    html = (Path(__file__).parents[1] / "web" / "index.html").read_text()
+
+    assert "tracker awaiting YOLO check" in html
+    assert "observation.confidence===null" in html
+    assert "selected_target_not_revalidated" in html

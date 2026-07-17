@@ -63,6 +63,7 @@ class CollieRuntime:
         produce_detector: ProduceDetectorProtocol | None = None,
         produce_tracker_factory: ProduceTrackerFactory | None = None,
         loop_hz: float = 8.0,
+        produce_revalidation_iou: float = 0.15,
     ) -> None:
         self.camera = camera
         self.controller = controller
@@ -74,6 +75,9 @@ class CollieRuntime:
             produce_tracker_factory or create_produce_tracker
         )
         self.loop_hz = float(loop_hz)
+        if not 0.0 <= produce_revalidation_iou <= 1.0:
+            raise ValueError("produce_revalidation_iou must be between 0 and 1")
+        self.produce_revalidation_iou = float(produce_revalidation_iou)
         self._state_lock = asyncio.Lock()
         self._action_lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
@@ -86,8 +90,8 @@ class CollieRuntime:
         self._target: TargetObservation | None = None
         self._produce_tracker: ProduceTrackerProtocol | None = None
         self._produce_tracker_label: str | None = None
-        self._produce_tracker_confidence = 0.0
         self._produce_visible_frames = 0
+        self._produce_verified_at: float | None = None
         self._produce_detections: list[FruitDetection] = []
         self._produce_frame_id: int | None = None
         self._produce_last_at: float | None = None
@@ -212,8 +216,8 @@ class CollieRuntime:
                     if self._selected_target_name == canonical_name:
                         self._produce_tracker = tracker
                         self._produce_tracker_label = canonical_name
-                        self._produce_tracker_confidence = detection.confidence
                         self._produce_visible_frames = 1
+                        self._produce_verified_at = self._produce_last_at
                         self._target = observation
             return await self.status()
 
@@ -302,11 +306,15 @@ class CollieRuntime:
                     "age_s": None if produce_age is None else round(produce_age, 3),
                     "inference_ms": self._produce_inference_ms,
                     "error": self._produce_error,
+                    "device": self._produce_device_status(),
                     "tracker": {
                         "label": self._produce_tracker_label,
                         "target": None
                         if self._produce_tracker_label is None or target is None
                         else target.to_dict(),
+                        "last_verified_age_s": None
+                        if self._produce_verified_at is None
+                        else round(now - self._produce_verified_at, 3),
                     },
                 },
                 "motion_enabled": self.motion_enabled,
@@ -336,7 +344,6 @@ class CollieRuntime:
                     selected_name = self._selected_target_name
                     tracker = self._produce_tracker
                     tracker_label = self._produce_tracker_label
-                    tracker_confidence = self._produce_tracker_confidence
                     tracker_visible_frames = self._produce_visible_frames
                 tracked_produce: TargetObservation | None = None
                 if (
@@ -351,7 +358,7 @@ class CollieRuntime:
                         tracked_produce = self._observation_from_bbox(
                             frame,
                             tuple(int(round(value)) for value in tracker_bbox),
-                            confidence=tracker_confidence,
+                            confidence=None,
                             visible_frames=tracker_visible_frames + 1,
                         )
                 produce_image = annotate_fruits(frame.bgr, produce_detections)
@@ -384,8 +391,7 @@ class CollieRuntime:
                             # inference frames.
                             self._selected_target_hint = tracked_produce.center
                         if tracked_produce is None:
-                            self._produce_tracker = None
-                            self._produce_tracker_label = None
+                            self._clear_selection_locked()
                     else:
                         selected_target = self._target
                     self._jpeg = jpeg
@@ -403,8 +409,7 @@ class CollieRuntime:
                 raise
             except Exception as exc:
                 async with self._state_lock:
-                    self._clear_produce_tracker_locked()
-                    self._target = None
+                    self._clear_selection_locked()
                     self._last_error = str(exc)
                 lost_while_armed = self._lease is not None
             if lost_while_armed:
@@ -429,6 +434,8 @@ class CollieRuntime:
                 inference_ms = (time.monotonic() - started) * 1000.0
                 for detection in detections:
                     print(detection.log_line(), flush=True)
+                refresh_tracker_for: tuple[str, FruitDetection, int] | None = None
+                revalidation_failed = False
                 async with self._state_lock:
                     self._produce_detections = detections
                     self._produce_frame_id = frame.frame_id
@@ -436,41 +443,68 @@ class CollieRuntime:
                     self._produce_inference_ms = round(inference_ms, 1)
                     self._produce_error = ""
                     selected_name = self._selected_target_name
-                    current_frame = self._latest_frame
-                    selected_detection = (
-                        self._best_produce_detection_locked(
-                            selected_name, self._selected_target_hint
+                    selected_target = self._target
+                    selected_detection = None
+                    if selected_name is not None:
+                        preferred_center = (
+                            selected_target.center
+                            if selected_target is not None
+                            else self._selected_target_hint
                         )
-                        if selected_name is not None
-                        and self._produce_tracker is None
-                        and self._lease is None
-                        else None
-                    )
-                if current_frame is not None and selected_detection is not None:
+                        selected_detection = self._best_produce_detection_locked(
+                            selected_name, preferred_center
+                        )
+                        tracker_is_active = (
+                            self._produce_tracker is not None
+                            and self._produce_tracker_label == selected_name
+                        )
+                        detection_matches_track = (
+                            selected_detection is not None
+                            and selected_target is not None
+                            and self._target_detection_iou(
+                                selected_target, selected_detection
+                            )
+                            >= self.produce_revalidation_iou
+                        )
+                        if tracker_is_active and not detection_matches_track:
+                            self._clear_selection_locked()
+                            revalidation_failed = True
+                        elif selected_detection is None:
+                            self._clear_selection_locked()
+                            revalidation_failed = True
+                        else:
+                            refresh_tracker_for = (
+                                selected_name,
+                                selected_detection,
+                                1
+                                if selected_target is None
+                                else selected_target.visible_frames,
+                            )
+                if revalidation_failed:
+                    await self.stop("selected_target_not_revalidated")
+                if refresh_tracker_for is not None:
+                    refresh_name, selected_detection, visible_frames = refresh_tracker_for
                     tracker = await asyncio.to_thread(
                         self.produce_tracker_factory,
-                        current_frame.bgr.copy(),
+                        frame.bgr.copy(),
                         self._detection_bbox_xywh(selected_detection),
                     )
                     observation = self._observation_from_bbox(
-                        current_frame,
+                        frame,
                         self._detection_bbox_xywh(selected_detection),
                         confidence=selected_detection.confidence,
-                        visible_frames=1,
+                        visible_frames=max(1, visible_frames),
                     )
                     async with self._state_lock:
                         if (
-                            self._selected_target_name == selected_name
-                            and selected_name is not None
-                            and self._produce_tracker is None
-                            and self._lease is None
+                            self._selected_target_name == refresh_name
+                            and refresh_name is not None
                         ):
                             self._produce_tracker = tracker
-                            self._produce_tracker_label = selected_name
-                            self._produce_tracker_confidence = (
-                                selected_detection.confidence
-                            )
-                            self._produce_visible_frames = 1
+                            self._produce_tracker_label = refresh_name
+                            self._produce_visible_frames = max(1, visible_frames)
+                            self._produce_verified_at = time.monotonic()
+                            self._selected_target_hint = selected_detection.center
                             self._target = observation
             except asyncio.CancelledError:
                 raise
@@ -528,8 +562,44 @@ class CollieRuntime:
     def _clear_produce_tracker_locked(self) -> None:
         self._produce_tracker = None
         self._produce_tracker_label = None
-        self._produce_tracker_confidence = 0.0
         self._produce_visible_frames = 0
+        self._produce_verified_at = None
+
+    def _clear_selection_locked(self) -> None:
+        self._selected_target_name = None
+        self._selected_target_hint = None
+        self._target = None
+        self._clear_produce_tracker_locked()
+
+    def _produce_device_status(self) -> dict[str, object]:
+        if self.produce_detector is None:
+            return {"requested": "disabled", "resolved": "disabled"}
+        status = getattr(self.produce_detector, "device_status", None)
+        if callable(status):
+            return status()
+        return {"requested": "test", "resolved": "test"}
+
+    @staticmethod
+    def _target_detection_iou(
+        target: TargetObservation, detection: FruitDetection
+    ) -> float:
+        target_x, target_y, target_width, target_height = target.bbox_xywh
+        target_x2 = target_x + target_width
+        target_y2 = target_y + target_height
+        detection_x1, detection_y1, detection_x2, detection_y2 = detection.bbox_xyxy
+        intersection_width = max(
+            0, min(target_x2, detection_x2) - max(target_x, detection_x1)
+        )
+        intersection_height = max(
+            0, min(target_y2, detection_y2) - max(target_y, detection_y1)
+        )
+        intersection = intersection_width * intersection_height
+        target_area = target_width * target_height
+        detection_area = max(0, detection_x2 - detection_x1) * max(
+            0, detection_y2 - detection_y1
+        )
+        union = target_area + detection_area - intersection
+        return 0.0 if union <= 0 else intersection / union
 
     @staticmethod
     def _detection_bbox_xywh(
@@ -543,7 +613,7 @@ class CollieRuntime:
         frame: CameraFrame,
         bbox_xywh: tuple[int, int, int, int],
         *,
-        confidence: float,
+        confidence: float | None,
         visible_frames: int,
     ) -> TargetObservation:
         x, y, width, height = bbox_xywh
@@ -556,6 +626,6 @@ class CollieRuntime:
             captured_monotonic_s=frame.captured_monotonic_s,
             bbox_xywh=(x, y, width, height),
             center=(x + width // 2, y + height // 2),
-            confidence=round(confidence, 4),
+            confidence=None if confidence is None else round(confidence, 4),
             visible_frames=visible_frames,
         )

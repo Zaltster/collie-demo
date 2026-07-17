@@ -47,7 +47,7 @@
   <script>
     const live=document.querySelector('#live'),camera=document.querySelector('#camera'),target=document.querySelector('#target'),command=document.querySelector('#command'),produce=document.querySelector('#produce'),produceMeta=document.querySelector('#produce-meta'),targetFeedback=document.querySelector('#target-feedback'),follow=document.querySelector('#follow'),stop=document.querySelector('#stop');
     let following=false,startingFollow=false,pulseLoopRunning=false,refreshInFlight=false,stopPromise=null;
-    const normalStops=new Set(['motion is not armed','motion is disarmed','forward_budget_complete','selected_target_not_found','selected_target_not_stable','selected_target_stale','frame_geometry_missing','unranged_forward_disabled']);
+    const normalStops=new Set(['motion is not armed','motion is disarmed','forward_budget_complete','selected_target_not_found','selected_target_not_stable','selected_target_stale','selected_target_not_revalidated','frame_geometry_missing','unranged_forward_disabled']);
     async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok){const e=await r.json();throw new Error(e.detail||r.statusText)}return r.json()}
     function closestSelectedIndex(detections,name,hint){
       if(!name||!hint)return -1;
@@ -67,7 +67,10 @@
       const classCount=Object.keys(state.classes||{}).length;
       produceMeta.textContent=`${classCount} model classes · threshold ${(state.confidence_threshold*100).toFixed(0)}% · inference ${state.inference_ms??'—'} ms · age ${state.age_s??'—'} s`;
     }
-    function seenLabel(observation){return observation?`${observation.visible_frames} frames · ${Math.round(observation.confidence*100)}%`:'not tracked'}
+    function seenLabel(observation){
+      if(!observation)return 'not tracked';
+      return observation.confidence===null?`${observation.visible_frames} frames · tracker awaiting YOLO check`:`${observation.visible_frames} frames · YOLO ${Math.round(observation.confidence*100)}%`;
+    }
     function updateFollowButton(canFollow){
       follow.textContent=following?'FOLLOWING…':'FOLLOW SELECTED FRUIT';
       follow.disabled=following||startingFollow||!canFollow;

@@ -55,6 +55,7 @@ def build_runtime() -> CollieRuntime:
         produce_detector=FruitDetector(
             produce_model,
             confidence=float(os.environ.get("COLLIE_PRODUCE_CONFIDENCE", "0.5")),
+            device=os.environ.get("COLLIE_INFERENCE_DEVICE", "").strip() or None,
         ),
     )
 

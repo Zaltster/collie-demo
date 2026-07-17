@@ -39,7 +39,11 @@ class FakeResult:
 class FakeModel:
     names = {2: "banana"}
 
-    def predict(self, **_: object) -> list[FakeResult]:
+    def __init__(self) -> None:
+        self.last_predict_options: dict[str, object] = {}
+
+    def predict(self, **options: object) -> list[FakeResult]:
+        self.last_predict_options = options
         return [FakeResult()]
 
 
@@ -54,7 +58,10 @@ class FakeUnitreeCamera:
 def test_fruit_detector_returns_label_confidence_box_and_center(tmp_path: Path) -> None:
     model_path = tmp_path / "fruit.pt"
     model_path.write_bytes(b"test")
-    detector = FruitDetector(model_path, confidence=0.5, model=FakeModel())
+    model = FakeModel()
+    detector = FruitDetector(
+        model_path, confidence=0.5, device="cuda:0", model=model
+    )
     frame = np.zeros((100, 100, 3), dtype=np.uint8)
 
     detections = detector.detect(frame)
@@ -65,6 +72,8 @@ def test_fruit_detector_returns_label_confidence_box_and_center(tmp_path: Path) 
     assert detection.confidence == 0.9123
     assert detection.bbox_xyxy == (10, 20, 51, 81)
     assert detection.center == (30, 50)
+    assert model.last_predict_options["device"] == "cuda:0"
+    assert detector.device_status()["requested"] == "cuda:0"
     assert np.any(annotate_fruits(frame, detections) != frame)
 
 

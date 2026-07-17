@@ -5,9 +5,9 @@
     "app": {
       "context": ".",
       "entitlements": [
-        {"type": "network", "mode": "host"}
+        {"type": "network", "mode": "host"},
+        {"type": "gpu"}
       ]
     }
   }
 }
-

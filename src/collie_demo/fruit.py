@@ -37,6 +37,7 @@ class FruitDetector:
         model_path: str | Path,
         *,
         confidence: float = 0.5,
+        device: str | int | None = None,
         model: Any | None = None,
     ) -> None:
         self.model_path = Path(model_path).expanduser().resolve()
@@ -45,6 +46,7 @@ class FruitDetector:
         if not 0.0 < confidence <= 1.0:
             raise ValueError("confidence must be in (0, 1]")
         self.confidence = float(confidence)
+        self.requested_device = device
         if model is None:
             from ultralytics import YOLO
 
@@ -59,11 +61,14 @@ class FruitDetector:
         }
 
     def detect(self, bgr: NDArray[np.uint8]) -> list[FruitDetection]:
-        results = self.model.predict(
-            source=bgr,
-            conf=self.confidence,
-            verbose=False,
-        )
+        predict_options: dict[str, object] = {
+            "source": bgr,
+            "conf": self.confidence,
+            "verbose": False,
+        }
+        if self.requested_device is not None:
+            predict_options["device"] = self.requested_device
+        results = self.model.predict(**predict_options)
         if not results:
             return []
         boxes = getattr(results[0], "boxes", None)
@@ -86,6 +91,40 @@ class FruitDetector:
                 )
             )
         return detections
+
+    def device_status(self) -> dict[str, object]:
+        try:
+            import torch
+
+            cuda_available = bool(torch.cuda.is_available())
+            cuda_version = torch.version.cuda
+            torch_version = torch.__version__
+        except Exception:
+            cuda_available = False
+            cuda_version = None
+            torch_version = "unavailable"
+        return {
+            "requested": "auto"
+            if self.requested_device is None
+            else str(self.requested_device),
+            "resolved": self._model_device(),
+            "cuda_available": cuda_available,
+            "cuda_version": cuda_version,
+            "torch_version": torch_version,
+        }
+
+    def _model_device(self) -> str:
+        inner_model = getattr(self.model, "model", None)
+        direct_device = getattr(inner_model, "device", None)
+        if direct_device is not None:
+            return str(direct_device)
+        parameters = getattr(inner_model, "parameters", None)
+        if callable(parameters):
+            try:
+                return str(next(parameters()).device)
+            except (StopIteration, AttributeError, TypeError):
+                pass
+        return "unresolved"
 
 
 def annotate_fruits(
@@ -134,9 +173,14 @@ def annotate_selected_produce(
     color = (255, 80, 255)
     cv2.rectangle(annotated, (x, y), (x + width, y + height), color, 5)
     cv2.circle(annotated, target.center, 6, (255, 255, 255), -1)
+    tracking_text = (
+        "TRACKER"
+        if target.confidence is None
+        else f"YOLO {target.confidence:.2f}"
+    )
     cv2.putText(
         annotated,
-        f"SELECTED {label.upper()} TRACKED {target.confidence:.2f}",
+        f"SELECTED {label.upper()} {tracking_text}",
         (max(8, x), max(24, y - 10)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
