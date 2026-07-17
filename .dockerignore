@@ -1,7 +1,10 @@
 .git
 .venv
 .pytest_cache
-__pycache__
+**/__pycache__
 tests
 captures
-
+models/*
+!models/snapstock/
+models/snapstock/*
+!models/snapstock/fruit_vegetable_yolov8m.pt

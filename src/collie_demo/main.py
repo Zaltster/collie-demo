@@ -9,6 +9,7 @@ from .app import create_app
 from .camera import create_camera
 from .controller import ApproachConfig, ApproachController
 from .detector import BlueWhaleDetector
+from .fruit import FruitDetector
 from .motion import MotionConfig, create_motion, initialize_dds
 from .runtime import CollieRuntime
 
@@ -25,6 +26,12 @@ def build_runtime() -> CollieRuntime:
     network_interface = os.environ.get("GO2_NETWORK_INTERFACE", "").strip() or None
     motion_enabled = env_bool("COLLIE_MOTION_ENABLED")
     allow_unranged = env_bool("COLLIE_ALLOW_UNRANGED_DEMO")
+    produce_model = Path(
+        os.environ.get(
+            "COLLIE_PRODUCE_MODEL",
+            "models/snapstock/fruit_vegetable_yolov8m.pt",
+        )
+    )
     initialize_dds(network_interface)
     controller_config = ApproachConfig(
         forward_mps=float(os.environ.get("COLLIE_FORWARD_MPS", "0.08")),
@@ -47,6 +54,10 @@ def build_runtime() -> CollieRuntime:
         motion=motion,
         motion_enabled=motion_enabled,
         allow_unranged_forward=allow_unranged,
+        produce_detector=FruitDetector(
+            produce_model,
+            confidence=float(os.environ.get("COLLIE_PRODUCE_CONFIDENCE", "0.5")),
+        ),
     )
 
 

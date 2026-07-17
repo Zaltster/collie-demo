@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import time
 
 import cv2
@@ -8,6 +9,7 @@ import numpy as np
 
 from collie_demo.controller import ApproachController
 from collie_demo.detector import BlueWhaleDetector
+from collie_demo.fruit import FruitDetection
 from collie_demo.motion import UnitreeMotionAdapter
 from collie_demo.runtime import ARM_CONFIRMATION, CollieRuntime, RuntimeCommandError
 from collie_demo.types import CameraFrame
@@ -26,6 +28,23 @@ class CenteredWhaleCamera:
         return CameraFrame(self.frame_id, time.monotonic(), image)
 
 
+class FakeProduceDetector:
+    model_path = Path("/models/snapstock.pt")
+    confidence = 0.5
+    names = {1: "apple"}
+
+    def detect(self, _image: object) -> list[FruitDetection]:
+        return [
+            FruitDetection(
+                class_id=1,
+                label="apple",
+                confidence=0.91,
+                bbox_xyxy=(100, 200, 180, 300),
+                center=(140, 250),
+            )
+        ]
+
+
 def test_runtime_requires_confirmation_then_pulses_forward() -> None:
     async def scenario() -> None:
         avoidance = FakeAvoidance()
@@ -37,6 +56,7 @@ def test_runtime_requires_confirmation_then_pulses_forward() -> None:
             motion=motion,
             motion_enabled=True,
             allow_unranged_forward=True,
+            produce_detector=FakeProduceDetector(),
             loop_hz=60.0,
         )
         await runtime.start()
@@ -53,6 +73,8 @@ def test_runtime_requires_confirmation_then_pulses_forward() -> None:
             assert status["armed"] is True
             assert status["command"]["reason"] == "supervised_forward_burst"
             assert avoidance.moves[-1] == (0.08, 0.0, 0.0)
+            assert status["produce"]["detections"][0]["label"] == "apple"
+            assert status["produce"]["inference_ms"] is not None
         finally:
             await runtime.close()
 

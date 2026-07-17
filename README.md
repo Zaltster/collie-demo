@@ -1,64 +1,86 @@
 # Collie Demo
 
-A self-contained Wendy app for Woof that uses the official Unitree camera,
-detects the blue whale on the floor, curves toward it, and stops when the
-target leaves the camera view.
+A self-contained Wendy app for Woof that preserves the guarded blue-whale
+approach demo and adds the SnapStock YOLOv8m fruit and vegetable detector.
+Frames come directly from Unitree's public `VideoClient`; inference,
+annotation, motion supervision, and the browser UI all run locally in the
+robot container. No Roboflow service, hosted inference API, Hugging Face key,
+or internet connection is used at runtime.
 
-## Behavior
+## Current deployed behavior
 
-- The blue whale must be detected for at least 8 consecutive frames.
-- Off-center targets produce forward and yaw commands together so Woof curves
-  toward the whale instead of turning in place first.
-- The operator must type `WHALE AND PATH CLEAR` and arm one burst.
-- Motion continues only while the browser sends hold pulses every 120 ms.
-- A 350 ms command watchdog brakes and revokes the motion lease.
-- One arm permits at most 4 seconds of continuous movement at 0.60 m/s.
-- Losing the whale, losing the camera, releasing the button, closing the page,
-  exhausting the time budget, disabling factory avoidance, or crashing the web
-  process invokes zero motion and `SportClient.StopMove`.
-- Non-zero movement goes through Unitree's `ObstaclesAvoidClient`; there is no
-  direct `SportClient.Move` fallback.
+- Loads `models/snapstock/fruit_vegetable_yolov8m.pt` locally.
+- Detects all 63 classes stored in that checkpoint.
+- Draws labels, confidence scores, bounding boxes, and box centers.
+- Prints every detection to the container log.
+- Serves the annotated Go2 camera and structured detections on port 8096.
+- Uses a 50% confidence threshold by default.
+- Continues detecting the blue whale at the original camera-loop rate.
+- Runs produce inference in a separate worker so a slow YOLO frame cannot
+  block hold pulses, stop commands, or the independent motion watchdog.
+- Keeps the exact arm confirmation, press-and-hold control, factory avoidance,
+  forward time budget, target-loss stop, and `StopMove` safety boundary.
 
-The motion boundary and independent process brake are adapted from the
-`go2-follow-clean` controller.
+Produce detections are informational. Only the blue-whale detector can satisfy
+the motion controller's target gate.
 
-## Important scope
+## Model
 
-This build proves **detect blue whale -> curve toward it -> stop on target
-loss**. It has no calibrated target distance or contact sensor. The whale
-leaving the camera view is only a visual stopping heuristic; it does not prove
-physical contact. Add calibrated range/contact sensing before relying on touch
-behavior around people or on a stage.
-
-## Operate the demo
-
-1. Confirm Woof, the target, and the entire path are clear.
-2. Wait until the page reports a stable blue-whale detection.
-3. Click **Arm one burst**.
-4. Press and hold **PRESS AND HOLD** to approach; release to stop immediately.
-5. Use **STOP NOW** at any time to disarm and brake.
-
-If the page reports `motion is not armed`, the lease is already disarmed or
-expired. Re-check the path and click **Arm one burst** again before holding the
-walk button.
-
-## Test
+Download the weight before building:
 
 ```sh
-python -m venv .venv
+mkdir -p models/snapstock
+curl -L --fail \
+  "https://huggingface.co/Senu-12/snapstock-fruit-vegetable-detector/resolve/main/yolov8/fruit_vegetable_yolov8m.pt?download=true" \
+  -o models/snapstock/fruit_vegetable_yolov8m.pt
+```
+
+The expected size is 52,089,985 bytes. Model files are excluded from Git but
+the Docker build context includes this exact weight.
+
+## Local test
+
+```sh
+python3 -m venv .venv
 . .venv/bin/activate
-pip install -e '.[test]'
+pip install -e '.[fruit,test]'
 pytest
+```
+
+Run on a Mac camera after granting camera permission:
+
+```sh
+collie-fruit-webcam \
+  --model models/snapstock/fruit_vegetable_yolov8m.pt \
+  --camera 0 \
+  --confidence 0.5
+```
+
+Run the browser UI against a JPEG source:
+
+```sh
+collie-fruit-ui \
+  --model models/snapstock/fruit_vegetable_yolov8m.pt \
+  --source http://woof.local:8096/camera.jpg \
+  --port 8097
 ```
 
 ## Deploy to Woof
 
-Deployment is intentionally separate from construction because this app has
-real motion authority when armed:
+The on-robot image reads the Unitree camera and motion clients over the network
+interface selected by `GO2_NETWORK_INTERFACE`, and binds the UI to port 8096:
 
 ```sh
 wendy --device woof.local run --yes --detach --restart-on-failure
 ```
 
-Then open `http://woof.local:8096/`. Keep the physical remote in hand and test
-first with Woof on a clear floor at the lowest configured speed.
+Verify the actual deployed runtime before considering it ready:
+
+```sh
+wendy --device woof.local device ps --json
+curl http://woof.local:8096/api/status
+```
+
+Then open `http://woof.local:8096/`. A healthy status response must report
+the SnapStock model path, all 63 classes under `produce`, a fresh blue-whale
+camera frame, motion state, and `ok: true`.

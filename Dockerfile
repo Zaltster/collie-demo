@@ -23,9 +23,12 @@ COPY pyproject.toml README.md ./
 COPY src/ src/
 RUN python -m venv /opt/collie-venv \
     && /opt/collie-venv/bin/python -m pip install --no-cache-dir --upgrade pip \
+    && /opt/collie-venv/bin/python -m pip install --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/cpu \
+      'torch==2.13.0+cpu' 'torchvision==0.28.0+cpu' \
     && /opt/collie-venv/bin/python -m pip install --no-cache-dir --no-deps \
       "git+https://github.com/unitreerobotics/unitree_sdk2_python.git@${UNITREE_SDK2_PYTHON_REF}" \
-    && /opt/collie-venv/bin/python -m pip install --no-cache-dir '.[robot]'
+    && /opt/collie-venv/bin/python -m pip install --no-cache-dir '.[robot,fruit]'
 
 FROM python:3.11-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -41,12 +44,15 @@ ENV CYCLONEDDS_HOME=/usr/local \
     COLLIE_PORT=8096 \
     COLLIE_MOTION_ENABLED=1 \
     COLLIE_ALLOW_UNRANGED_DEMO=1 \
+    COLLIE_PRODUCE_MODEL=/app/models/snapstock/fruit_vegetable_yolov8m.pt \
+    COLLIE_PRODUCE_CONFIDENCE=0.5 \
     COLLIE_WEB_DIRECTORY=/app/web \
     COLLIE_FORWARD_MPS=0.60 \
     COLLIE_FORWARD_BUDGET_S=4.0
 
 WORKDIR /app
 COPY web/ web/
+COPY models/snapstock/fruit_vegetable_yolov8m.pt models/snapstock/fruit_vegetable_yolov8m.pt
 
 EXPOSE 8096
 CMD ["python", "-m", "collie_demo.supervisor"]

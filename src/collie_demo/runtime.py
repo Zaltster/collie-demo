@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import time
 from typing import Protocol
 
 from .controller import ApproachController
 from .detector import BlueWhaleDetector, annotate
+from .fruit import FruitDetection, annotate_fruits
 from .motion import MotionError, MotionNotReady, UnitreeMotionAdapter
 from .types import BlueWhaleObservation, CameraFrame, VelocityCommand
 
@@ -15,6 +17,14 @@ ARM_CONFIRMATION = "WHALE AND PATH CLEAR"
 
 class CameraProtocol(Protocol):
     def read(self) -> CameraFrame: ...
+
+
+class ProduceDetectorProtocol(Protocol):
+    model_path: Path
+    confidence: float
+    names: dict[int, str]
+
+    def detect(self, bgr: object) -> list[FruitDetection]: ...
 
 
 class RuntimeCommandError(RuntimeError):
@@ -31,6 +41,7 @@ class CollieRuntime:
         motion: UnitreeMotionAdapter | None,
         motion_enabled: bool,
         allow_unranged_forward: bool,
+        produce_detector: ProduceDetectorProtocol | None = None,
         loop_hz: float = 8.0,
     ) -> None:
         self.camera = camera
@@ -39,13 +50,21 @@ class CollieRuntime:
         self.motion = motion
         self.motion_enabled = bool(motion_enabled)
         self.allow_unranged_forward = bool(allow_unranged_forward)
+        self.produce_detector = produce_detector
         self.loop_hz = float(loop_hz)
         self._state_lock = asyncio.Lock()
         self._action_lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
+        self._produce_task: asyncio.Task[None] | None = None
         self._closing = False
         self._jpeg: bytes | None = None
+        self._latest_frame: CameraFrame | None = None
         self._target: BlueWhaleObservation | None = None
+        self._produce_detections: list[FruitDetection] = []
+        self._produce_frame_id: int | None = None
+        self._produce_last_at: float | None = None
+        self._produce_inference_ms: float | None = None
+        self._produce_error = "waiting for first inference" if produce_detector else "disabled"
         self._frame_width: int | None = None
         self._frame_count = 0
         self._last_frame_at: float | None = None
@@ -63,6 +82,8 @@ class CollieRuntime:
                 self._last_error = str(exc)
         self._closing = False
         self._task = asyncio.create_task(self._camera_loop())
+        if self.produce_detector is not None:
+            self._produce_task = asyncio.create_task(self._produce_loop())
 
     async def close(self) -> None:
         self._closing = True
@@ -70,6 +91,12 @@ class CollieRuntime:
             self._task.cancel()
             try:
                 await self._task
+            except asyncio.CancelledError:
+                pass
+        if self._produce_task is not None:
+            self._produce_task.cancel()
+            try:
+                await self._produce_task
             except asyncio.CancelledError:
                 pass
         await self.stop("shutdown")
@@ -154,6 +181,9 @@ class CollieRuntime:
             now = time.monotonic()
             frame_age = None if self._last_frame_at is None else now - self._last_frame_at
             target_age = None if self._target is None else now - self._target.captured_monotonic_s
+            produce_age = (
+                None if self._produce_last_at is None else now - self._produce_last_at
+            )
             target = self._target
             return {
                 "ok": frame_age is not None and frame_age < 1.0,
@@ -162,6 +192,18 @@ class CollieRuntime:
                 "last_error": self._last_error,
                 "blue_whale": None if target is None else target.to_dict(),
                 "blue_whale_age_s": None if target_age is None else round(target_age, 3),
+                "produce": None
+                if self.produce_detector is None
+                else {
+                    "model_path": str(self.produce_detector.model_path),
+                    "confidence_threshold": self.produce_detector.confidence,
+                    "classes": self.produce_detector.names,
+                    "detections": [item.to_dict() for item in self._produce_detections],
+                    "frame_id": self._produce_frame_id,
+                    "age_s": None if produce_age is None else round(produce_age, 3),
+                    "inference_ms": self._produce_inference_ms,
+                    "error": self._produce_error,
+                },
                 "motion_enabled": self.motion_enabled,
                 "allow_unranged_forward": self.allow_unranged_forward,
                 "armed": self._lease is not None and self.motion is not None and self.motion.armed,
@@ -184,7 +226,14 @@ class CollieRuntime:
             try:
                 frame = await asyncio.to_thread(self.camera.read)
                 target = self.detector.detect(frame)
-                jpeg = annotate(frame, target)
+                async with self._state_lock:
+                    self._latest_frame = frame
+                    produce_detections = list(self._produce_detections)
+                produce_image = annotate_fruits(frame.bgr, produce_detections)
+                annotated_frame = CameraFrame(
+                    frame.frame_id, frame.captured_monotonic_s, produce_image
+                )
+                jpeg = annotate(annotated_frame, target)
                 async with self._state_lock:
                     self._jpeg = jpeg
                     self._target = target
@@ -207,6 +256,37 @@ class CollieRuntime:
                 await self.stop("blue_whale_lost")
             await asyncio.sleep(max(0.0, period - (time.monotonic() - started)))
 
+    async def _produce_loop(self) -> None:
+        assert self.produce_detector is not None
+        last_frame_id = 0
+        while not self._closing:
+            async with self._state_lock:
+                frame = self._latest_frame
+            if frame is None or frame.frame_id == last_frame_id:
+                await asyncio.sleep(0.01)
+                continue
+            last_frame_id = frame.frame_id
+            started = time.monotonic()
+            try:
+                detections = await asyncio.to_thread(
+                    self.produce_detector.detect, frame.bgr.copy()
+                )
+                inference_ms = (time.monotonic() - started) * 1000.0
+                for detection in detections:
+                    print(detection.log_line(), flush=True)
+                async with self._state_lock:
+                    self._produce_detections = detections
+                    self._produce_frame_id = frame.frame_id
+                    self._produce_last_at = time.monotonic()
+                    self._produce_inference_ms = round(inference_ms, 1)
+                    self._produce_error = ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                async with self._state_lock:
+                    self._produce_error = str(exc)
+            await asyncio.sleep(0)
+
     async def _release_locked(self, reason: str) -> None:
         if self.motion is not None and self._lease is not None:
             try:
@@ -216,4 +296,3 @@ class CollieRuntime:
         self._lease = None
         self._last_pulse_at = None
         self._command = VelocityCommand(reason=reason)
-
