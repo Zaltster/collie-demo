@@ -75,9 +75,12 @@ class CollieRuntime:
         self.motion_enabled = bool(motion_enabled)
         self.allow_unranged_forward = bool(allow_unranged_forward)
         self.produce_detector = produce_detector
-        self.produce_tracker_factory = (
-            produce_tracker_factory or create_produce_tracker
-        )
+        # A local OpenCV tracker is optional. On the Go2 Jetson, MIL tracker
+        # updates and repeated tracker initialization can take longer than the
+        # 350 ms target-freshness safety window. The production runtime uses
+        # the GPU YOLO detections as the authoritative track instead. Tests or
+        # other deployments can still opt into a local tracker explicitly.
+        self.produce_tracker_factory = produce_tracker_factory
         self.loop_hz = float(loop_hz)
         if not 0.0 <= produce_revalidation_iou <= 1.0:
             raise ValueError("produce_revalidation_iou must be between 0 and 1")
@@ -267,12 +270,14 @@ class CollieRuntime:
             if selection_error is not None:
                 raise RuntimeCommandError(selection_error)
             if frame is not None and detection is not None:
+                tracker: ProduceTrackerProtocol | None = None
                 try:
-                    tracker = await asyncio.to_thread(
-                        self.produce_tracker_factory,
-                        frame.bgr.copy(),
-                        self._detection_bbox_xywh(detection),
-                    )
+                    if self.produce_tracker_factory is not None:
+                        tracker = await asyncio.to_thread(
+                            self.produce_tracker_factory,
+                            frame.bgr.copy(),
+                            self._detection_bbox_xywh(detection),
+                        )
                 except Exception as exc:
                     async with self._state_lock:
                         self._clear_selection_locked()
@@ -288,7 +293,9 @@ class CollieRuntime:
                 async with self._state_lock:
                     if self._selected_target_name == canonical_name:
                         self._produce_tracker = tracker
-                        self._produce_tracker_label = canonical_name
+                        self._produce_tracker_label = (
+                            canonical_name if tracker is not None else None
+                        )
                         self._produce_visible_frames = 1
                         self._produce_verified_at = self._produce_last_at
                         self._produce_revalidation_failures = 0
@@ -424,6 +431,9 @@ class CollieRuntime:
                     "error": self._produce_error,
                     "device": device_status,
                     "tracker": {
+                        "mode": "yolo+local"
+                        if self.produce_tracker_factory is not None
+                        else "yolo",
                         "label": self._produce_tracker_label,
                         "target": None
                         if self._produce_tracker_label is None or target is None
@@ -468,6 +478,7 @@ class CollieRuntime:
                     tracker = self._produce_tracker
                     tracker_label = self._produce_tracker_label
                     tracker_visible_frames = self._produce_visible_frames
+                    current_target = self._target
                 tracked_produce: TargetObservation | None = None
                 if (
                     selected_name is not None
@@ -488,7 +499,9 @@ class CollieRuntime:
                 produce_image = annotate_selected_produce(
                     produce_image,
                     selected_name,
-                    tracked_produce,
+                    tracked_produce
+                    if tracked_produce is not None
+                    else current_target,
                 )
                 encoded_ok, encoded = cv2.imencode(
                     ".jpg", produce_image, [cv2.IMWRITE_JPEG_QUALITY, 88]
@@ -590,7 +603,7 @@ class CollieRuntime:
                             >= self.produce_revalidation_iou
                         )
                         if selected_detection is None or (
-                            tracker_is_active and not detection_matches_track
+                            selected_target is not None and not detection_matches_track
                         ):
                             self._produce_revalidation_failures += 1
                             if (
@@ -601,47 +614,55 @@ class CollieRuntime:
                                 revalidation_failed = True
                         else:
                             self._produce_revalidation_failures = 0
-                            refresh_tracker_for = (
-                                selected_name,
-                                selected_detection,
+                            visible_frames = (
                                 1
                                 if selected_target is None
-                                else selected_target.visible_frames,
+                                else selected_target.visible_frames + 1
                             )
-                if revalidation_failed:
-                    await self.stop("selected_target_not_revalidated")
-                if refresh_tracker_for is not None:
-                    refresh_name, selected_detection, visible_frames = refresh_tracker_for
-                    tracker = await asyncio.to_thread(
-                        self.produce_tracker_factory,
-                        frame.bgr.copy(),
-                        self._detection_bbox_xywh(selected_detection),
-                    )
-                    observation = self._observation_from_bbox(
-                        frame,
-                        self._detection_bbox_xywh(selected_detection),
-                        confidence=selected_detection.confidence,
-                        visible_frames=max(1, visible_frames),
-                    )
-                    async with self._state_lock:
-                        if (
-                            self._selected_target_name == refresh_name
-                            and refresh_name is not None
-                        ):
-                            self._produce_tracker = tracker
-                            self._produce_tracker_label = refresh_name
-                            self._produce_visible_frames = max(1, visible_frames)
-                            self._produce_verified_at = time.monotonic()
-                            self._selected_target_hint = selected_detection.center
-                            # YOLO finishes after its source frame was captured.
-                            # Never replace a newer camera-loop tracker result
-                            # with that older inference-frame observation.
+                            observation = self._observation_from_bbox(
+                                frame,
+                                self._detection_bbox_xywh(selected_detection),
+                                confidence=selected_detection.confidence,
+                                visible_frames=visible_frames,
+                            )
                             if (
                                 self._target is None
                                 or observation.captured_monotonic_s
                                 >= self._target.captured_monotonic_s
                             ):
                                 self._target = observation
+                            self._produce_visible_frames = visible_frames
+                            self._produce_verified_at = time.monotonic()
+                            self._selected_target_hint = selected_detection.center
+                            if (
+                                self.produce_tracker_factory is not None
+                                and not tracker_is_active
+                            ):
+                                refresh_tracker_for = (
+                                    selected_name,
+                                    selected_detection,
+                                    visible_frames,
+                                )
+                if revalidation_failed:
+                    await self.stop("selected_target_not_revalidated")
+                if refresh_tracker_for is not None:
+                    refresh_name, selected_detection, visible_frames = refresh_tracker_for
+                    tracker_factory = self.produce_tracker_factory
+                    if tracker_factory is None:
+                        continue
+                    tracker = await asyncio.to_thread(
+                        tracker_factory,
+                        frame.bgr.copy(),
+                        self._detection_bbox_xywh(selected_detection),
+                    )
+                    async with self._state_lock:
+                        if (
+                            self._selected_target_name == refresh_name
+                            and refresh_name is not None
+                        ):
+                            if self._produce_tracker is None:
+                                self._produce_tracker = tracker
+                                self._produce_tracker_label = refresh_name
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

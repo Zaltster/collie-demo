@@ -95,6 +95,12 @@ class SlowProduceDetector(FakeProduceDetector):
         return super().detect(image)
 
 
+class JetsonSpeedProduceDetector(FakeProduceDetector):
+    def detect(self, image: object) -> list[FruitDetection]:
+        time.sleep(0.12)
+        return super().detect(image)
+
+
 class FakeProduceTracker:
     def __init__(self, bbox: tuple[int, int, int, int]) -> None:
         self.bbox = bbox
@@ -473,6 +479,53 @@ def test_old_yolo_result_does_not_replace_fresh_tracker_observation() -> None:
             assert max(target_ages) < 0.35
             assert "selected_target_stale" not in readiness
             assert status["can_follow"] is True
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_detector_only_tracking_stays_fresh_at_jetson_cadence() -> None:
+    async def scenario() -> None:
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(
+                ApproachConfig(stable_frames_required=3)
+            ),
+            motion=UnitreeMotionAdapter(FakeSport(), FakeAvoidance()),
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            produce_detector=JetsonSpeedProduceDetector(),
+            loop_hz=8.0,
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                status = await runtime.status()
+                if status["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("detector never returned a frame")
+
+            await runtime.select_target("banana", (350, 240))
+            await asyncio.sleep(0.5)
+            statuses = []
+            for _ in range(60):
+                statuses.append(await runtime.status())
+                await asyncio.sleep(0.02)
+
+            assert all(
+                item["produce"]["tracker"]["mode"] == "yolo"
+                for item in statuses
+            )
+            assert all(
+                item["selected_target"]["confidence"] is not None
+                for item in statuses
+            )
+            assert max(item["selected_target_age_s"] for item in statuses) < 0.35
+            assert all(item["follow_readiness"] == "ready" for item in statuses)
+            assert all(item["can_follow"] is True for item in statuses)
         finally:
             await runtime.close()
 
