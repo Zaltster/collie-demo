@@ -47,6 +47,9 @@ def build_runtime() -> CollieRuntime:
     initialize_dds(network_interface)
     controller_config = ApproachConfig(
         stable_frames_required=int(os.environ.get("COLLIE_STABLE_FRAMES", "3")),
+        maximum_target_age_s=float(
+            os.environ.get("COLLIE_MAX_TARGET_AGE_S", "0.35")
+        ),
         forward_mps=float(os.environ.get("COLLIE_FORWARD_MPS", "0.08")),
         forward_budget_s=float(os.environ.get("COLLIE_FORWARD_BUDGET_S", "1.5")),
     )

@@ -565,9 +565,26 @@ class CollieRuntime:
                 raise
             except Exception as exc:
                 async with self._state_lock:
-                    self._clear_selection_locked()
                     self._last_error = str(exc)
-                lost_while_armed = self._lease is not None
+                    # Unitree's camera occasionally returns one malformed JPEG.
+                    # A single bad sample must not erase an otherwise fresh,
+                    # YOLO-verified selection.  Preserve the last observation
+                    # until the same bounded target-age rule used by the motion
+                    # controller says the camera outage is genuinely stale.
+                    now = time.monotonic()
+                    last_frame_age = (
+                        None
+                        if self._last_frame_at is None
+                        else now - self._last_frame_at
+                    )
+                    camera_is_stale = (
+                        last_frame_age is None
+                        or last_frame_age
+                        > self.controller.config.maximum_target_age_s
+                    )
+                    if camera_is_stale:
+                        self._clear_selection_locked()
+                lost_while_armed = camera_is_stale and self._lease is not None
             if lost_while_armed:
                 await self.stop("selected_target_lost")
             await asyncio.sleep(max(0.0, period - (time.monotonic() - started)))

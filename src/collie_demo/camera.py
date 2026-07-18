@@ -25,8 +25,13 @@ class UnitreeCamera:
         self._frame_id = 0
 
     def read(self) -> CameraFrame:
-        captured = time.monotonic()
         code, payload = self._client.GetImageSample()
+        # GetImageSample is a blocking RPC.  Timestamping before it starts makes
+        # a newly returned image appear older by the full camera/network wait,
+        # which can consume most of the controller's freshness budget before
+        # inference even begins.  The SDK payload has no source timestamp, so
+        # receipt time is the honest local freshness boundary.
+        received = time.monotonic()
         if int(code) != 0:
             raise CameraUnavailable(f"VideoClient returned {code}")
         encoded = np.frombuffer(bytes(payload), dtype=np.uint8)
@@ -34,7 +39,7 @@ class UnitreeCamera:
         if image is None or image.ndim != 3:
             raise CameraUnavailable("camera returned an invalid JPEG")
         self._frame_id += 1
-        return CameraFrame(self._frame_id, captured, image)
+        return CameraFrame(self._frame_id, received, image)
 
 
 def create_camera(timeout_s: float = 3.0) -> UnitreeCamera:
@@ -44,4 +49,3 @@ def create_camera(timeout_s: float = 3.0) -> UnitreeCamera:
     client.SetTimeout(float(timeout_s))
     client.Init()
     return UnitreeCamera(client)
-

@@ -16,7 +16,11 @@ or internet connection is used at runtime.
 - Draws labels, confidence scores, bounding boxes, and box centers.
 - Prints every detection to the container log.
 - Serves the annotated Go2 camera and structured detections on port 8096.
-- Uses tested per-class thresholds: apple 80%, banana 70%, and pear 80%.
+- Uses tested per-class thresholds: apple 80%, banana 35%, and pear 80%.
+  The lower banana threshold preserves detection as the robot closes in; the
+  close-view live set scored 39.8-52.8%, while the benchmark had no banana
+  false positives at 30% and three historical non-target frames stayed below
+  6.2%.
 - Makes every live detection selectable. Selection sends both the model class
   and bounding-box center, so either of two visible apples can be selected
   independently; one click on `Follow Selected Fruit` then starts the guarded
@@ -126,7 +130,7 @@ curl http://woof.local:8096/api/status
 
 Then open `http://woof.local:8096/`. A healthy status response must report the
 Collie YOLOE model path, `produce.class_thresholds` of `apple: 0.8`,
-`banana: 0.7`, and `pear: 0.8`, the selected fruit and its current observation,
+`banana: 0.35`, and `pear: 0.8`, the selected fruit and its current observation,
 `produce.device.resolved: "cuda:0"`, motion state, and `ok: true`. In this
 stage configuration the model only returns apple, banana, and pear detections.
 

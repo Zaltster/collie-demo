@@ -25,6 +25,18 @@ class StaticFruitCamera:
         return CameraFrame(self.frame_id, time.monotonic(), image)
 
 
+class OneBadFrameCamera(StaticFruitCamera):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next = False
+
+    def read(self) -> CameraFrame:
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("camera returned an invalid JPEG")
+        return super().read()
+
+
 class FakeProduceDetector:
     model_path = Path("/models/snapstock.pt")
     confidence = 0.5
@@ -229,6 +241,46 @@ def test_yolo_miss_clears_selected_tracker() -> None:
                 == 3
             )
             assert status["command"]["reason"] == "selected_target_not_revalidated"
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_one_bad_camera_frame_does_not_clear_fresh_selection() -> None:
+    async def scenario() -> None:
+        camera = OneBadFrameCamera()
+        runtime = CollieRuntime(
+            camera=camera,
+            controller=ApproachController(
+                ApproachConfig(
+                    stable_frames_required=3,
+                    maximum_target_age_s=0.75,
+                )
+            ),
+            motion=None,
+            motion_enabled=False,
+            allow_unranged_forward=True,
+            produce_detector=FakeProduceDetector(),
+            loop_hz=60.0,
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                status = await runtime.status()
+                if status["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("produce detector never returned a frame")
+
+            await runtime.select_target("banana", (350, 240))
+            camera.fail_next = True
+            await asyncio.sleep(0.08)
+
+            status = await runtime.status()
+            assert status["selected_target_name"] == "banana"
+            assert status["selected_target"] is not None
         finally:
             await runtime.close()
 
