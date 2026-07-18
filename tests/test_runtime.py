@@ -198,7 +198,7 @@ def test_runtime_requires_confirmation_then_pulses_forward() -> None:
     asyncio.run(scenario())
 
 
-def test_yolo_miss_clears_selected_tracker() -> None:
+def test_sustained_yolo_loss_clears_selected_tracker() -> None:
     async def scenario() -> None:
         detector = ToggleProduceDetector()
         runtime = CollieRuntime(
@@ -210,6 +210,7 @@ def test_yolo_miss_clears_selected_tracker() -> None:
             produce_detector=detector,
             produce_tracker_factory=fake_tracker_factory,
             loop_hz=60.0,
+            maximum_produce_age_s=0.05,
         )
         await runtime.start()
         try:
@@ -287,7 +288,7 @@ def test_one_bad_camera_frame_does_not_clear_fresh_selection() -> None:
     asyncio.run(scenario())
 
 
-def test_two_transient_yolo_misses_do_not_clear_selected_tracker() -> None:
+def test_three_fast_yolo_misses_do_not_clear_fresh_selection() -> None:
     async def scenario() -> None:
         detector = BurstMissProduceDetector()
         runtime = CollieRuntime(
@@ -309,7 +310,7 @@ def test_two_transient_yolo_misses_do_not_clear_selected_tracker() -> None:
                     break
                 await asyncio.sleep(0.01)
             await runtime.select_target("banana", (350, 240))
-            detector.misses_remaining = 2
+            detector.misses_remaining = 3
             await asyncio.sleep(0.08)
 
             status = await runtime.status()
@@ -451,7 +452,7 @@ def test_stop_cancels_a_follow_request_waiting_for_target_stability() -> None:
     asyncio.run(scenario())
 
 
-def test_three_yolo_misses_stop_an_active_robot_side_follow() -> None:
+def test_sustained_yolo_loss_stops_an_active_robot_side_follow() -> None:
     async def scenario() -> None:
         detector = ToggleProduceDetector()
         sport, avoidance = FakeSport(), FakeAvoidance()
@@ -465,6 +466,7 @@ def test_three_yolo_misses_stop_an_active_robot_side_follow() -> None:
             produce_detector=detector,
             produce_tracker_factory=fake_tracker_factory,
             loop_hz=60.0,
+            maximum_produce_age_s=0.05,
             follow_period_s=0.02,
         )
         await runtime.start()
@@ -480,7 +482,7 @@ def test_three_yolo_misses_stop_an_active_robot_side_follow() -> None:
                     break
                 await asyncio.sleep(0.01)
             else:
-                raise AssertionError("active follow did not stop after three misses")
+                raise AssertionError("active follow did not stop after sustained loss")
 
             assert status["follow_active"] is False
             assert status["command"]["reason"] == "selected_target_not_revalidated"

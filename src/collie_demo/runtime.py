@@ -643,9 +643,8 @@ class CollieRuntime:
                             selected_target is not None and not detection_matches_track
                         ):
                             self._produce_revalidation_failures += 1
-                            if (
-                                self._produce_revalidation_failures
-                                >= self.produce_revalidation_misses_required
+                            if self._produce_revalidation_expired_locked(
+                                time.monotonic()
                             ):
                                 self._clear_selection_locked()
                                 revalidation_failed = True
@@ -714,9 +713,8 @@ class CollieRuntime:
                     self._produce_error = str(exc)
                     if self._selected_target_name is not None:
                         self._produce_revalidation_failures += 1
-                        if (
-                            self._produce_revalidation_failures
-                            >= self.produce_revalidation_misses_required
+                        if self._produce_revalidation_expired_locked(
+                            time.monotonic()
                         ):
                             self._clear_selection_locked()
                             revalidation_failed = True
@@ -834,6 +832,24 @@ class CollieRuntime:
         ):
             return "selected_target_not_revalidated"
         return None
+
+    def _produce_revalidation_expired_locked(self, now: float) -> bool:
+        """Bound target loss by both misses and elapsed time.
+
+        Jetson inference cadence varies, so three quick low-confidence results
+        must not erase a still-fresh click.  Conversely, the elapsed-time bound
+        guarantees that a genuinely missing target is cleared independently of
+        frame rate.
+        """
+        if (
+            self._produce_revalidation_failures
+            < self.produce_revalidation_misses_required
+        ):
+            return False
+        return (
+            self._produce_verified_at is None
+            or now - self._produce_verified_at > self.maximum_produce_age_s
+        )
 
     @staticmethod
     def _target_detection_iou(
