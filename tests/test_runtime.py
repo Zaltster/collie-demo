@@ -9,7 +9,12 @@ import numpy as np
 from collie_demo.controller import ApproachConfig, ApproachController
 from collie_demo.fruit import FruitDetection
 from collie_demo.motion import UnitreeMotionAdapter
-from collie_demo.runtime import ARM_CONFIRMATION, CollieRuntime, RuntimeCommandError
+from collie_demo.runtime import (
+    ARM_CONFIRMATION,
+    NAVIGATION_ARM_CONFIRMATION,
+    CollieRuntime,
+    RuntimeCommandError,
+)
 from collie_demo.types import CameraFrame
 
 from test_motion import FakeAvoidance, FakeSport
@@ -192,6 +197,74 @@ def test_runtime_requires_confirmation_then_pulses_forward() -> None:
                 pass
             else:
                 raise AssertionError("invalid target color was accepted")
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_navigation_owner_accepts_bounded_commands_without_a_fruit() -> None:
+    async def scenario() -> None:
+        avoidance = FakeAvoidance()
+        motion = UnitreeMotionAdapter(FakeSport(), avoidance)
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(),
+            motion=motion,
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            produce_detector=FakeProduceDetector(),
+            loop_hz=60.0,
+            navigation_command_lease_s=0.05,
+        )
+        await runtime.start()
+        try:
+            try:
+                await runtime.navigation_arm("wrong")
+            except RuntimeCommandError:
+                pass
+            else:
+                raise AssertionError("wrong navigation confirmation armed motion")
+
+            armed = await runtime.navigation_arm(NAVIGATION_ARM_CONFIRMATION)
+            assert armed["armed"] is True
+            assert armed["owner"] == "navigation"
+            commanded = await runtime.navigation_command(0.3, -0.2)
+            assert commanded["command"]["forward_mps"] == 0.08
+            assert commanded["command"]["yaw_rps"] == -0.2
+            try:
+                await runtime.pulse()
+            except RuntimeCommandError:
+                pass
+            else:
+                raise AssertionError("fruit pulse stole the navigation lease")
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_navigation_lease_expires_to_hardware_stop() -> None:
+    async def scenario() -> None:
+        sport = FakeSport()
+        motion = UnitreeMotionAdapter(sport, FakeAvoidance())
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(),
+            motion=motion,
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            loop_hz=60.0,
+            navigation_command_lease_s=0.05,
+        )
+        await runtime.start()
+        try:
+            await runtime.navigation_arm(NAVIGATION_ARM_CONFIRMATION)
+            await runtime.navigation_command(0.03, 0.0)
+            await asyncio.sleep(0.18)
+            status = await runtime.navigation_status()
+            assert status["armed"] is False
+            assert sport.stop_calls >= 1
         finally:
             await runtime.close()
 

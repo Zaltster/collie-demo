@@ -14,6 +14,7 @@ from .types import CameraFrame, TargetObservation, VelocityCommand
 
 
 ARM_CONFIRMATION = "TARGET AND PATH CLEAR"
+NAVIGATION_ARM_CONFIRMATION = "MAP AND PATH CLEAR"
 
 
 class CameraProtocol(Protocol):
@@ -69,6 +70,8 @@ class CollieRuntime:
         maximum_produce_age_s: float = 0.75,
         follow_period_s: float = 0.05,
         follow_start_timeout_s: float = 1.5,
+        navigation_idle_arm_s: float = 30.0,
+        navigation_command_lease_s: float = 0.75,
     ) -> None:
         self.camera = camera
         self.controller = controller
@@ -100,6 +103,12 @@ class CollieRuntime:
         if follow_start_timeout_s <= 0.0:
             raise ValueError("follow_start_timeout_s must be positive")
         self.follow_start_timeout_s = float(follow_start_timeout_s)
+        if navigation_idle_arm_s <= 0.0:
+            raise ValueError("navigation_idle_arm_s must be positive")
+        self.navigation_idle_arm_s = float(navigation_idle_arm_s)
+        if navigation_command_lease_s <= 0.0:
+            raise ValueError("navigation_command_lease_s must be positive")
+        self.navigation_command_lease_s = float(navigation_command_lease_s)
         self._state_lock = asyncio.Lock()
         self._action_lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
@@ -125,6 +134,9 @@ class CollieRuntime:
         self._last_frame_at: float | None = None
         self._last_error = "waiting for camera"
         self._lease: str | None = None
+        self._motion_owner: str | None = None
+        self._navigation_deadline: float | None = None
+        self._navigation_watchdog_task: asyncio.Task[None] | None = None
         self._last_pulse_at: float | None = None
         self._forward_elapsed_s = 0.0
         self._command = VelocityCommand(reason="disarmed")
@@ -141,6 +153,9 @@ class CollieRuntime:
         self._task = asyncio.create_task(self._camera_loop())
         if self.produce_detector is not None:
             self._produce_task = asyncio.create_task(self._produce_loop())
+        self._navigation_watchdog_task = asyncio.create_task(
+            self._navigation_watchdog_loop()
+        )
 
     async def close(self) -> None:
         self._closing = True
@@ -164,6 +179,13 @@ class CollieRuntime:
                 await self._produce_task
             except asyncio.CancelledError:
                 pass
+        if self._navigation_watchdog_task is not None:
+            self._navigation_watchdog_task.cancel()
+            try:
+                await self._navigation_watchdog_task
+            except asyncio.CancelledError:
+                pass
+            self._navigation_watchdog_task = None
         await self.stop("shutdown")
         if self.motion is not None:
             await self.motion.close()
@@ -185,10 +207,102 @@ class CollieRuntime:
             except MotionError as exc:
                 raise RuntimeCommandError(str(exc)) from exc
             self._lease = lease
+            self._motion_owner = "fruit"
+            self._navigation_deadline = None
             self._last_pulse_at = None
             self._forward_elapsed_s = 0.0
             self._command = VelocityCommand(reason="armed_waiting_for_hold")
             return await self.status()
+
+    async def navigation_arm(self, confirmation: str) -> dict[str, object]:
+        """Acquire the factory-avoidance lease for map navigation only."""
+
+        async with self._action_lock:
+            if confirmation.strip().upper() != NAVIGATION_ARM_CONFIRMATION:
+                raise RuntimeCommandError(
+                    f'type exactly "{NAVIGATION_ARM_CONFIRMATION}"'
+                )
+            if not self.motion_enabled or self.motion is None:
+                raise RuntimeCommandError("motion backend is disabled")
+            if self._lease is not None or self.motion.armed:
+                raise RuntimeCommandError("motion is already owned; stop it first")
+            async with self._state_lock:
+                self._clear_selection_locked()
+            try:
+                lease = await self.motion.arm()
+            except MotionError as exc:
+                raise RuntimeCommandError(str(exc)) from exc
+            self._lease = lease
+            self._motion_owner = "navigation"
+            self._navigation_deadline = (
+                time.monotonic() + self.navigation_idle_arm_s
+            )
+            self._last_pulse_at = None
+            self._forward_elapsed_s = 0.0
+            self._command = VelocityCommand(reason="navigation_armed_zero")
+            return await self.navigation_status()
+
+    async def navigation_command(
+        self, forward_mps: float, yaw_rps: float
+    ) -> dict[str, object]:
+        """Send one bounded map-navigation heartbeat for the active lease."""
+
+        async with self._action_lock:
+            if self._motion_owner != "navigation":
+                raise RuntimeCommandError("navigation motion is not armed")
+            if (
+                self.motion is None
+                or self._lease is None
+                or not self.motion.armed
+            ):
+                self._lease = None
+                self._motion_owner = None
+                self._navigation_deadline = None
+                raise RuntimeCommandError("navigation motion is not armed")
+            command = VelocityCommand(
+                forward_mps=float(forward_mps),
+                yaw_rps=float(yaw_rps),
+                reason="map_navigation",
+            )
+            try:
+                self._command = await self.motion.send(self._lease, command)
+            except (MotionError, ValueError) as exc:
+                self._lease = None
+                self._motion_owner = None
+                self._navigation_deadline = None
+                self._command = VelocityCommand(reason="navigation_motion_fault")
+                raise RuntimeCommandError(str(exc)) from exc
+            self._navigation_deadline = (
+                time.monotonic() + self.navigation_command_lease_s
+            )
+            return await self.navigation_status()
+
+    async def navigation_status(self) -> dict[str, object]:
+        now = time.monotonic()
+        motion_status = None if self.motion is None else self.motion.status()
+        available = bool(
+            self.motion_enabled
+            and motion_status is not None
+            and motion_status["initialized"]
+            and motion_status["fault"] is None
+        )
+        armed = bool(
+            self._motion_owner == "navigation"
+            and self._lease is not None
+            and self.motion is not None
+            and self.motion.armed
+        )
+        return {
+            "available": available,
+            "armed": armed,
+            "owner": self._motion_owner,
+            "fault": None if motion_status is None else motion_status["fault"],
+            "deadline_s": None
+            if self._navigation_deadline is None
+            else round(max(0.0, self._navigation_deadline - now), 3),
+            "command": self._command.to_dict(),
+            "limits": None if motion_status is None else motion_status["limits"],
+        }
 
     async def start_follow(self, confirmation: str) -> dict[str, object]:
         generation = self._follow_start_generation
@@ -305,8 +419,15 @@ class CollieRuntime:
 
     async def pulse(self) -> dict[str, object]:
         async with self._action_lock:
-            if self.motion is None or self._lease is None or not self.motion.armed:
+            if self._motion_owner != "fruit":
+                raise RuntimeCommandError("fruit motion is not armed")
+            if (
+                self.motion is None
+                or self._lease is None
+                or not self.motion.armed
+            ):
                 self._lease = None
+                self._motion_owner = None
                 if self._command.forward_mps != 0.0 or self._command.yaw_rps != 0.0:
                     self._command = VelocityCommand(reason="motion_not_armed")
                 raise RuntimeCommandError("motion is not armed")
@@ -349,6 +470,8 @@ class CollieRuntime:
             if self.motion is not None:
                 await self.motion.emergency_stop()
             self._lease = None
+            self._motion_owner = None
+            self._navigation_deadline = None
             self._last_pulse_at = None
             self._command = VelocityCommand(reason=reason)
             return await self.status()
@@ -473,6 +596,8 @@ class CollieRuntime:
                 else follow_readiness,
                 "follow_active": follow_active,
                 "armed": self._lease is not None and self.motion is not None and self.motion.armed,
+                "motion_owner": self._motion_owner,
+                "navigation": await self.navigation_status(),
                 "command": self._command.to_dict(),
                 "forward_budget_s": self.controller.config.forward_budget_s,
                 "forward_elapsed_s": round(self._forward_elapsed_s, 3),
@@ -556,7 +681,7 @@ class CollieRuntime:
                     self._frame_count += 1
                     self._last_frame_at = time.monotonic()
                     self._last_error = ""
-                lost_while_armed = self._lease is not None and (
+                lost_while_armed = self._motion_owner == "fruit" and self._lease is not None and (
                     selected_target is None
                     or selected_target.visible_frames
                     < self.controller.config.stable_frames_required
@@ -584,7 +709,11 @@ class CollieRuntime:
                     )
                     if camera_is_stale:
                         self._clear_selection_locked()
-                lost_while_armed = camera_is_stale and self._lease is not None
+                lost_while_armed = (
+                    camera_is_stale
+                    and self._motion_owner == "fruit"
+                    and self._lease is not None
+                )
             if lost_while_armed:
                 await self.stop("selected_target_lost")
             await asyncio.sleep(max(0.0, period - (time.monotonic() - started)))
@@ -741,6 +870,17 @@ class CollieRuntime:
             if self._follow_task is current_task:
                 self._follow_task = None
 
+    async def _navigation_watchdog_loop(self) -> None:
+        while not self._closing:
+            await asyncio.sleep(0.10)
+            deadline = self._navigation_deadline
+            if (
+                self._motion_owner == "navigation"
+                and deadline is not None
+                and time.monotonic() >= deadline
+            ):
+                await self.stop("navigation_lease_expired")
+
     async def _release_locked(self, reason: str) -> None:
         if self.motion is not None and self._lease is not None:
             try:
@@ -748,6 +888,8 @@ class CollieRuntime:
             except MotionError:
                 await self.motion.emergency_stop()
         self._lease = None
+        self._motion_owner = None
+        self._navigation_deadline = None
         self._last_pulse_at = None
         self._command = VelocityCommand(reason=reason)
 

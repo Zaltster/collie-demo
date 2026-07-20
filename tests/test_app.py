@@ -41,6 +41,24 @@ class FakeRuntime:
             "follow_active": True,
         }
 
+    async def navigation_status(self) -> dict[str, object]:
+        return {"available": True, "armed": False}
+
+    async def navigation_arm(self, confirmation: str) -> dict[str, object]:
+        return {"available": True, "armed": True, "confirmation": confirmation}
+
+    async def navigation_command(
+        self, forward_mps: float, yaw_rps: float
+    ) -> dict[str, object]:
+        return {
+            "available": True,
+            "armed": True,
+            "command": {"forward_mps": forward_mps, "yaw_rps": yaw_rps},
+        }
+
+    async def stop(self, reason: str = "user_stop") -> dict[str, object]:
+        return {"armed": False, "reason": reason}
+
 
 def test_target_endpoint_selects_a_specific_detection(tmp_path: Path) -> None:
     (tmp_path / "index.html").write_text("ok")
@@ -66,3 +84,28 @@ def test_target_endpoint_selects_a_specific_detection(tmp_path: Path) -> None:
         assert follow.json()["follow_active"] is True
         assert client.get("/camera.jpg").content == b"annotated-jpeg"
         assert client.get("/camera-raw.jpg").content == b"raw-jpeg"
+
+
+def test_navigation_motion_endpoints_are_separate_from_fruit_follow(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "index.html").write_text("ok")
+    runtime = FakeRuntime()
+
+    with TestClient(create_app(runtime, tmp_path)) as client:  # type: ignore[arg-type]
+        assert client.get("/api/navigation/status").json()["available"] is True
+        armed = client.post(
+            "/api/navigation/arm", json={"confirmation": "MAP AND PATH CLEAR"}
+        )
+        assert armed.status_code == 200
+        assert armed.json()["armed"] is True
+        command = client.post(
+            "/api/navigation/cmd",
+            json={"forward_mps": 0.3, "yaw_rps": -0.2},
+        )
+        assert command.status_code == 200
+        assert command.json()["command"] == {
+            "forward_mps": 0.3,
+            "yaw_rps": -0.2,
+        }
+        assert client.post("/api/navigation/stop").json()["armed"] is False

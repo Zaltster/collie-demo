@@ -21,6 +21,12 @@ class TargetRequest(BaseModel):
     center: tuple[int, int] | None = None
 
 
+class NavigationCommandRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    forward_mps: float
+    yaw_rps: float
+
+
 def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -85,5 +91,32 @@ def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
     @app.post("/api/stop")
     async def stop() -> dict[str, object]:
         return await runtime.stop()
+
+    @app.get("/api/navigation/status")
+    async def navigation_status() -> dict[str, object]:
+        return await runtime.navigation_status()
+
+    @app.post("/api/navigation/arm")
+    async def navigation_arm(request: ArmRequest) -> dict[str, object]:
+        try:
+            return await runtime.navigation_arm(request.confirmation)
+        except RuntimeCommandError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/navigation/cmd")
+    async def navigation_command(
+        request: NavigationCommandRequest,
+    ) -> dict[str, object]:
+        try:
+            return await runtime.navigation_command(
+                request.forward_mps, request.yaw_rps
+            )
+        except RuntimeCommandError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/navigation/stop")
+    async def navigation_stop() -> dict[str, object]:
+        await runtime.stop("navigation_stop")
+        return await runtime.navigation_status()
 
     return app
