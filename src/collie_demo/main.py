@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -9,6 +10,10 @@ from .app import create_app
 from .camera import create_camera
 from .controller import ApproachConfig, ApproachController
 from .fruit import FruitDetector
+from .heading import SportModeHeadingProvider
+from .matcher import FruitInstanceMatcher
+from .memory import AppearanceEncoder
+from .mission import MissionConfig
 from .motion import MotionConfig, create_motion, initialize_dds
 from .runtime import CollieRuntime
 
@@ -45,6 +50,48 @@ def build_runtime() -> CollieRuntime:
         )
     )
     initialize_dds(network_interface)
+    mission_config = MissionConfig(
+        enabled=env_bool("COLLIE_MEMORY_DEMO_ENABLED"),
+        autonomous_turn_enabled=env_bool("COLLIE_AUTONOMOUS_TURN_ENABLED"),
+        direct_turn_enabled=env_bool("COLLIE_DIRECT_TURN_ENABLED"),
+        capture_samples=int(os.environ.get("COLLIE_MEMORY_SAMPLES", "5")),
+        capture_timeout_s=float(
+            os.environ.get("COLLIE_MEMORY_CAPTURE_TIMEOUT_S", "2.0")
+        ),
+        match_confirmations_required=int(
+            os.environ.get("COLLIE_MATCH_CONFIRMATIONS", "3")
+        ),
+        approach_misses_allowed=int(
+            os.environ.get("COLLIE_APPROACH_MATCH_MISSES", "2")
+        ),
+        turn_angle_rad=math.radians(
+            float(os.environ.get("COLLIE_TURN_ANGLE_DEG", "180"))
+        ),
+        turn_rate_rps=float(os.environ.get("COLLIE_TURN_RATE_RPS", "0.30")),
+        turn_tolerance_rad=math.radians(
+            float(os.environ.get("COLLIE_TURN_TOLERANCE_DEG", "7"))
+        ),
+        turn_timeout_s=float(os.environ.get("COLLIE_TURN_TIMEOUT_S", "15")),
+        turn_stall_timeout_s=float(
+            os.environ.get("COLLIE_TURN_STALL_TIMEOUT_S", "2.0")
+        ),
+        turn_stall_min_progress_rad=math.radians(
+            float(os.environ.get("COLLIE_TURN_STALL_MIN_PROGRESS_DEG", "10"))
+        ),
+        search_rate_rps=float(os.environ.get("COLLIE_SEARCH_RATE_RPS", "0.20")),
+        search_sweep_rad=math.radians(
+            float(os.environ.get("COLLIE_SEARCH_SWEEP_DEG", "75"))
+        ),
+        search_timeout_s=float(
+            os.environ.get("COLLIE_SEARCH_TIMEOUT_S", "9")
+        ),
+        near_bottom_ratio=float(
+            os.environ.get("COLLIE_NEAR_BOTTOM_RATIO", "0.86")
+        ),
+        near_center_ratio=float(
+            os.environ.get("COLLIE_NEAR_CENTER_RATIO", "0.72")
+        ),
+    )
     controller_config = ApproachConfig(
         stable_frames_required=int(os.environ.get("COLLIE_STABLE_FRAMES", "3")),
         maximum_target_age_s=float(
@@ -57,7 +104,11 @@ def build_runtime() -> CollieRuntime:
         create_motion(
             MotionConfig(
                 maximum_forward_mps=controller_config.forward_mps,
-                maximum_yaw_rps=controller_config.maximum_yaw_rps,
+                maximum_yaw_rps=max(
+                    controller_config.maximum_yaw_rps,
+                    mission_config.turn_rate_rps,
+                    mission_config.search_rate_rps,
+                ),
             )
         )
         if motion_enabled
@@ -87,6 +138,32 @@ def build_runtime() -> CollieRuntime:
         follow_start_timeout_s=float(
             os.environ.get("COLLIE_FOLLOW_START_TIMEOUT_S", "1.5")
         ),
+        instance_matcher=FruitInstanceMatcher(
+            AppearanceEncoder(
+                minimum_crop_side_px=int(
+                    os.environ.get("COLLIE_MIN_MEMORY_CROP_PX", "20")
+                )
+            ),
+            minimum_score=float(
+                os.environ.get("COLLIE_INSTANCE_MATCH_SCORE", "0.76")
+            ),
+            minimum_margin=float(
+                os.environ.get("COLLIE_INSTANCE_MATCH_MARGIN", "0.06")
+            ),
+            maximum_saved_similarity=float(
+                os.environ.get("COLLIE_SAVED_INSTANCE_REJECTION_SCORE", "0.94")
+            ),
+        ),
+        heading_provider=(
+            SportModeHeadingProvider(
+                maximum_age_s=float(
+                    os.environ.get("COLLIE_HEADING_MAX_AGE_S", "0.5")
+                )
+            )
+            if mission_config.enabled
+            else None
+        ),
+        mission_config=mission_config,
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from pathlib import Path
 import time
 from typing import Callable, Protocol
@@ -9,12 +10,17 @@ import cv2
 
 from .controller import ApproachController
 from .fruit import FruitDetection, annotate_fruits, annotate_selected_produce
+from .heading import HeadingProviderProtocol, directed_progress
+from .matcher import CandidateMatch, FruitInstanceMatcher, MatchResult
+from .memory import FruitMemory, encode_jpeg
+from .mission import MissionConfig, MissionPhase, MissionTelemetry
 from .motion import MotionError, MotionNotReady, UnitreeMotionAdapter
 from .types import CameraFrame, TargetObservation, VelocityCommand
 
 
 ARM_CONFIRMATION = "TARGET AND PATH CLEAR"
 NAVIGATION_ARM_CONFIRMATION = "MAP AND PATH CLEAR"
+DEMO_CONFIRMATION = "TARGET SAVED AND AREA CLEAR"
 
 
 class CameraProtocol(Protocol):
@@ -72,6 +78,9 @@ class CollieRuntime:
         follow_start_timeout_s: float = 1.5,
         navigation_idle_arm_s: float = 30.0,
         navigation_command_lease_s: float = 0.75,
+        instance_matcher: FruitInstanceMatcher | None = None,
+        heading_provider: HeadingProviderProtocol | None = None,
+        mission_config: MissionConfig | None = None,
     ) -> None:
         self.camera = camera
         self.controller = controller
@@ -109,6 +118,9 @@ class CollieRuntime:
         if navigation_command_lease_s <= 0.0:
             raise ValueError("navigation_command_lease_s must be positive")
         self.navigation_command_lease_s = float(navigation_command_lease_s)
+        self.instance_matcher = instance_matcher or FruitInstanceMatcher()
+        self.heading_provider = heading_provider
+        self.mission_config = mission_config or MissionConfig()
         self._state_lock = asyncio.Lock()
         self._action_lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
@@ -125,6 +137,7 @@ class CollieRuntime:
         self._produce_verified_at: float | None = None
         self._produce_revalidation_failures = 0
         self._produce_detections: list[FruitDetection] = []
+        self._produce_frame: CameraFrame | None = None
         self._produce_frame_id: int | None = None
         self._produce_last_at: float | None = None
         self._produce_inference_ms: float | None = None
@@ -142,8 +155,13 @@ class CollieRuntime:
         self._command = VelocityCommand(reason="disarmed")
         self._follow_task: asyncio.Task[None] | None = None
         self._follow_start_generation = 0
+        self._fruit_memory: FruitMemory | None = None
+        self._mission = MissionTelemetry()
+        self._mission_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
+        if self.heading_provider is not None:
+            self.heading_provider.start()
         if self.motion_enabled and self.motion is not None:
             try:
                 await self.motion.initialize()
@@ -160,6 +178,13 @@ class CollieRuntime:
     async def close(self) -> None:
         self._closing = True
         self._follow_start_generation += 1
+        if self._mission_task is not None:
+            self._mission_task.cancel()
+            try:
+                await self._mission_task
+            except asyncio.CancelledError:
+                pass
+            self._mission_task = None
         if self._follow_task is not None:
             self._follow_task.cancel()
             try:
@@ -189,6 +214,8 @@ class CollieRuntime:
         await self.stop("shutdown")
         if self.motion is not None:
             await self.motion.close()
+        if self.heading_provider is not None:
+            self.heading_provider.close()
 
     async def arm(self, confirmation: str) -> dict[str, object]:
         async with self._action_lock:
@@ -277,6 +304,50 @@ class CollieRuntime:
             )
             return await self.navigation_status()
 
+    async def _direct_turn_arm(self) -> None:
+        """Acquire the private yaw-only SportClient lease for the demo turn."""
+
+        async with self._action_lock:
+            if not self.motion_enabled or self.motion is None:
+                raise RuntimeCommandError("motion backend is disabled")
+            if self._lease is not None or self.motion.armed:
+                raise RuntimeCommandError("motion is already owned; stop it first")
+            try:
+                lease = await self.motion.arm_direct_yaw()
+            except MotionError as exc:
+                raise RuntimeCommandError(str(exc)) from exc
+            self._lease = lease
+            self._motion_owner = "direct_turn"
+            self._navigation_deadline = None
+            self._last_pulse_at = None
+            self._command = VelocityCommand(reason="direct_turn_armed_zero")
+
+    async def _direct_turn_command(self, yaw_rps: float) -> None:
+        """Renew one yaw-only heartbeat; translation is impossible in this mode."""
+
+        async with self._action_lock:
+            if self._motion_owner != "direct_turn":
+                raise RuntimeCommandError("direct turn motion is not armed")
+            if (
+                self.motion is None
+                or self._lease is None
+                or not self.motion.armed
+            ):
+                self._lease = None
+                self._motion_owner = None
+                raise RuntimeCommandError("direct turn motion is not armed")
+            try:
+                self._command = await self.motion.send_direct_yaw(
+                    self._lease,
+                    yaw_rps,
+                    "measured_direct_turn",
+                )
+            except (MotionError, ValueError) as exc:
+                self._lease = None
+                self._motion_owner = None
+                self._command = VelocityCommand(reason="direct_turn_motion_fault")
+                raise RuntimeCommandError(str(exc)) from exc
+
     async def navigation_status(self) -> dict[str, object]:
         now = time.monotonic()
         motion_status = None if self.motion is None else self.motion.status()
@@ -307,8 +378,20 @@ class CollieRuntime:
     async def start_follow(self, confirmation: str) -> dict[str, object]:
         generation = self._follow_start_generation
         deadline = time.monotonic() + self.follow_start_timeout_s
+        print(
+            "follow event=start_requested "
+            f"generation={generation} "
+            f"timeout_s={self.follow_start_timeout_s:.2f}",
+            flush=True,
+        )
         while True:
             if generation != self._follow_start_generation:
+                print(
+                    "follow event=start_cancelled "
+                    f"expected_generation={generation} "
+                    f"actual_generation={self._follow_start_generation}",
+                    flush=True,
+                )
                 raise RuntimeCommandError("follow start cancelled")
             async with self._state_lock:
                 selected_name = self._selected_target_name
@@ -336,14 +419,23 @@ class CollieRuntime:
             await self.stop("follow_already_active")
             raise RuntimeCommandError("follow is already active")
         self._follow_task = asyncio.create_task(self._follow_loop())
+        print(
+            "follow event=armed "
+            f"generation={generation} "
+            f"target={selected_name}",
+            flush=True,
+        )
         return await self.status()
 
     async def select_target(
         self,
         target_name: str,
         preferred_center: tuple[int, int] | None = None,
+        *,
+        confirmed_visible_frames: int = 1,
     ) -> dict[str, object]:
         canonical_name = self._canonical_target_name(target_name)
+        confirmed_visible_frames = max(1, int(confirmed_visible_frames))
         self._follow_start_generation += 1
         async with self._action_lock:
             if self.motion is not None and (
@@ -403,7 +495,7 @@ class CollieRuntime:
                     frame,
                     self._detection_bbox_xywh(detection),
                     confidence=detection.confidence,
-                    visible_frames=1,
+                    visible_frames=confirmed_visible_frames,
                 )
                 async with self._state_lock:
                     if self._selected_target_name == canonical_name:
@@ -411,11 +503,171 @@ class CollieRuntime:
                         self._produce_tracker_label = (
                             canonical_name if tracker is not None else None
                         )
-                        self._produce_visible_frames = 1
+                        self._produce_visible_frames = confirmed_visible_frames
                         self._produce_verified_at = self._produce_last_at
                         self._produce_revalidation_failures = 0
                         self._target = observation
             return await self.status()
+
+    async def remember_target(
+        self,
+        target_name: str,
+        preferred_center: tuple[int, int] | None = None,
+    ) -> dict[str, object]:
+        """Capture several detector-aligned views without arming motion."""
+
+        if not self.mission_config.enabled:
+            raise RuntimeCommandError("fruit-memory demo is disabled")
+        canonical_name = self._canonical_target_name(target_name)
+        await self.stop("memory_capture")
+        async with self._state_lock:
+            # A new capture attempt starts a new round. Never leave an older
+            # fruit silently armed as the fallback if this capture is poor.
+            self._fruit_memory = None
+            self._clear_selection_locked()
+            self._mission = MissionTelemetry(
+                phase=MissionPhase.LEARNING,
+                reason="capturing_reference_views",
+                started_monotonic_s=time.monotonic(),
+            )
+
+        samples = []
+        reference_crop = None
+        reference_bbox: tuple[int, int, int, int] | None = None
+        reference_quality = -1.0
+        last_frame_id: int | None = None
+        hint = preferred_center
+        deadline = time.monotonic() + self.mission_config.capture_timeout_s
+        while (
+            len(samples) < self.mission_config.capture_samples
+            and time.monotonic() < deadline
+        ):
+            async with self._state_lock:
+                frame = self._produce_frame
+                frame_id = self._produce_frame_id
+                detection = self._best_produce_detection_locked(
+                    canonical_name, hint
+                )
+                produce_age = (
+                    None
+                    if self._produce_last_at is None
+                    else time.monotonic() - self._produce_last_at
+                )
+            if (
+                frame is None
+                or frame_id is None
+                or frame_id == last_frame_id
+                or detection is None
+                or produce_age is None
+                or produce_age > self.maximum_produce_age_s
+            ):
+                await asyncio.sleep(0.02)
+                continue
+            last_frame_id = frame_id
+            hint = detection.center
+            try:
+                descriptor, crop = await asyncio.to_thread(
+                    self.instance_matcher.encoder.encode_bbox,
+                    frame.bgr.copy(),
+                    detection.bbox_xyxy,
+                )
+            except ValueError:
+                await asyncio.sleep(0)
+                continue
+            samples.append(descriptor)
+            if descriptor.quality > reference_quality:
+                reference_quality = descriptor.quality
+                reference_crop = crop
+                reference_bbox = detection.bbox_xyxy
+            await asyncio.sleep(0)
+
+        if (
+            len(samples) < self.mission_config.capture_samples
+            or reference_crop is None
+            or reference_bbox is None
+        ):
+            async with self._state_lock:
+                self._mission.phase = MissionPhase.ABORTED
+                self._mission.reason = "insufficient_reference_views"
+            raise RuntimeCommandError(
+                "keep the fruit clearly visible and steady, then save it again"
+            )
+        memory = FruitMemory.create(
+            label=canonical_name,
+            samples=samples,
+            reference_jpeg=await asyncio.to_thread(encode_jpeg, reference_crop),
+            reference_bbox_xyxy=reference_bbox,
+        )
+        async with self._state_lock:
+            self._fruit_memory = memory
+            self._clear_selection_locked()
+            self._mission = MissionTelemetry(
+                phase=MissionPhase.MEMORIZED,
+                reason="fruit_saved",
+            )
+        return await self.status()
+
+    async def clear_memory(self) -> dict[str, object]:
+        await self.stop("memory_reset")
+        async with self._state_lock:
+            self._fruit_memory = None
+            self._clear_selection_locked()
+            self._mission = MissionTelemetry(
+                phase=MissionPhase.IDLE,
+                reason="memory_reset",
+            )
+        return await self.status()
+
+    async def memory_reference_jpeg(self) -> bytes | None:
+        async with self._state_lock:
+            memory = self._fruit_memory
+        return None if memory is None else memory.reference_jpeg
+
+    async def start_demo(self, confirmation: str) -> dict[str, object]:
+        if confirmation.strip().upper() != DEMO_CONFIRMATION:
+            raise RuntimeCommandError(f'type exactly "{DEMO_CONFIRMATION}"')
+        if not self.mission_config.enabled:
+            raise RuntimeCommandError("fruit-memory demo is disabled")
+        if not self.mission_config.autonomous_turn_enabled:
+            raise RuntimeCommandError("autonomous turn is disabled")
+        if self._mission_task is not None and not self._mission_task.done():
+            raise RuntimeCommandError("fruit-memory demo is already active")
+        if not self.motion_enabled or self.motion is None:
+            raise RuntimeCommandError("motion backend is disabled")
+        if self.heading_provider is None or not self.heading_provider.status().healthy:
+            raise RuntimeCommandError("fresh Go2 heading is unavailable")
+        async with self._state_lock:
+            if self._fruit_memory is None:
+                raise RuntimeCommandError("save a fruit first")
+            now = time.monotonic()
+            camera_fresh = (
+                self._last_frame_at is not None
+                and now - self._last_frame_at < 1.0
+            )
+            produce_fresh = (
+                self._produce_last_at is not None
+                and now - self._produce_last_at < self.maximum_produce_age_s
+                and not self._produce_error
+            )
+        if not camera_fresh or not produce_fresh:
+            raise RuntimeCommandError("camera or fruit detector is not fresh")
+        await self.stop("demo_start_reset")
+        async with self._state_lock:
+            self._clear_selection_locked()
+            self._mission = MissionTelemetry(
+                phase=MissionPhase.TURNING,
+                reason="starting_measured_turn",
+                started_monotonic_s=time.monotonic(),
+            )
+        self._mission_task = asyncio.create_task(self._demo_loop())
+        return await self.status()
+
+    async def stop_demo(self) -> dict[str, object]:
+        await self.stop("demo_operator_stop")
+        async with self._state_lock:
+            self._mission.phase = MissionPhase.ABORTED
+            self._mission.reason = "operator_stop"
+        return await self.status()
 
     async def pulse(self) -> dict[str, object]:
         async with self._action_lock:
@@ -465,6 +717,30 @@ class CollieRuntime:
             return await self.status()
 
     async def stop(self, reason: str = "user_stop") -> dict[str, object]:
+        current_task = asyncio.current_task()
+        mission_task = self._mission_task
+        # Target-loss stops are the safety brake for an active approach. Keep
+        # the mission monitor alive just long enough to classify the stopped
+        # run as reached-camera-edge versus lost-before-arrival. All operator,
+        # watchdog, navigation, and shutdown stops still cancel it immediately.
+        preserve_mission_for_classification = reason in {
+            "selected_target_lost",
+            "selected_target_not_revalidated",
+        }
+        cancelled_mission = bool(
+            mission_task is not None
+            and mission_task is not current_task
+            and not mission_task.done()
+            and not preserve_mission_for_classification
+        )
+        if cancelled_mission and mission_task is not None:
+            mission_task.cancel()
+            try:
+                await mission_task
+            except asyncio.CancelledError:
+                pass
+            if self._mission_task is mission_task:
+                self._mission_task = None
         self._follow_start_generation += 1
         async with self._action_lock:
             if self.motion is not None:
@@ -474,7 +750,15 @@ class CollieRuntime:
             self._navigation_deadline = None
             self._last_pulse_at = None
             self._command = VelocityCommand(reason=reason)
-            return await self.status()
+        if cancelled_mission:
+            async with self._state_lock:
+                if self._mission.phase not in {
+                    MissionPhase.SUCCESS,
+                    MissionPhase.ABORTED,
+                }:
+                    self._mission.phase = MissionPhase.ABORTED
+                    self._mission.reason = reason
+        return await self.status()
 
     async def jpeg(self) -> bytes | None:
         async with self._state_lock:
@@ -497,6 +781,11 @@ class CollieRuntime:
         return encoded.tobytes()
 
     async def status(self) -> dict[str, object]:
+        heading = (
+            None
+            if self.heading_provider is None
+            else self.heading_provider.status()
+        )
         async with self._state_lock:
             now = time.monotonic()
             frame_age = None if self._last_frame_at is None else now - self._last_frame_at
@@ -537,9 +826,61 @@ class CollieRuntime:
                 and follow_readiness is None
                 and motion_ready
             )
+            stage_ready = camera_live and produce_live and gpu_ready and motion_ready
+            mission_active = bool(
+                self._mission_task is not None and not self._mission_task.done()
+            )
+            if not self.mission_config.enabled:
+                demo_readiness = "fruit-memory demo disabled"
+            elif not self.mission_config.autonomous_turn_enabled:
+                demo_readiness = "autonomous turn disabled"
+            elif self._fruit_memory is None:
+                demo_readiness = "save a fruit first"
+            elif heading is None or not heading.healthy:
+                demo_readiness = "fresh Go2 heading unavailable"
+            elif not stage_ready:
+                demo_readiness = "stage health is not ready"
+            elif mission_active:
+                demo_readiness = "demo already active"
+            elif self._lease is not None or (self.motion is not None and self.motion.armed):
+                demo_readiness = "motion is already armed"
+            else:
+                demo_readiness = "ready"
+            mission_status = self._mission.to_dict(now)
+            mission_status.update(
+                {
+                    "enabled": self.mission_config.enabled,
+                    "autonomous_turn_enabled": self.mission_config.autonomous_turn_enabled,
+                    "direct_turn_enabled": self.mission_config.direct_turn_enabled,
+                    "target_policy": "different_instance",
+                    "saved_instance_rejection_score": (
+                        self.instance_matcher.maximum_saved_similarity
+                    ),
+                    "turn_rate_rps": self.mission_config.turn_rate_rps,
+                    "turn_timeout_s": self.mission_config.turn_timeout_s,
+                    "turn_stall_timeout_s": self.mission_config.turn_stall_timeout_s,
+                    "turn_stall_min_progress_deg": round(
+                        math.degrees(
+                            self.mission_config.turn_stall_min_progress_rad
+                        ),
+                        1,
+                    ),
+                    "active": mission_active,
+                    "can_remember": bool(
+                        self.mission_config.enabled
+                        and produce_live
+                        and self._produce_detections
+                        and not mission_active
+                    ),
+                    "can_start": demo_readiness == "ready",
+                    "readiness": demo_readiness,
+                    "confirmation": DEMO_CONFIRMATION,
+                    "heading": None if heading is None else heading.to_dict(),
+                }
+            )
             return {
                 "ok": camera_live,
-                "stage_ready": camera_live and produce_live and gpu_ready and motion_ready,
+                "stage_ready": stage_ready,
                 "health": {
                     "camera_live": camera_live,
                     "produce_live": produce_live,
@@ -597,6 +938,10 @@ class CollieRuntime:
                 "follow_active": follow_active,
                 "armed": self._lease is not None and self.motion is not None and self.motion.armed,
                 "motion_owner": self._motion_owner,
+                "memory": None
+                if self._fruit_memory is None
+                else self._fruit_memory.to_status(now),
+                "mission": mission_status,
                 "navigation": await self.navigation_status(),
                 "command": self._command.to_dict(),
                 "forward_budget_s": self.controller.config.forward_budget_s,
@@ -740,6 +1085,7 @@ class CollieRuntime:
                 revalidation_failed = False
                 async with self._state_lock:
                     self._produce_detections = detections
+                    self._produce_frame = frame
                     self._produce_frame_id = frame.frame_id
                     self._produce_last_at = time.monotonic()
                     self._produce_inference_ms = round(inference_ms, 1)
@@ -834,6 +1180,7 @@ class CollieRuntime:
                 revalidation_failed = False
                 async with self._state_lock:
                     self._produce_detections = []
+                    self._produce_frame = frame
                     self._produce_frame_id = frame.frame_id
                     self._produce_last_at = time.monotonic()
                     self._produce_inference_ms = round(
@@ -850,6 +1197,373 @@ class CollieRuntime:
                 if revalidation_failed:
                     await self.stop("selected_target_not_revalidated")
             await asyncio.sleep(0)
+
+    async def _demo_loop(self) -> None:
+        current_task = asyncio.current_task()
+        try:
+            await self._run_measured_turn()
+            match = await self._search_for_memory()
+            await self._start_memory_approach(match)
+            await self._monitor_memory_approach()
+        except asyncio.CancelledError:
+            raise
+        except RuntimeCommandError as exc:
+            reason = str(exc)
+            await self.stop(f"demo_abort:{reason}")
+            async with self._state_lock:
+                self._mission.phase = MissionPhase.ABORTED
+                self._mission.reason = reason
+        except Exception as exc:
+            reason = f"demo_internal_error:{exc}"
+            await self.stop(reason)
+            async with self._state_lock:
+                self._mission.phase = MissionPhase.ABORTED
+                self._mission.reason = reason
+                self._last_error = reason
+        finally:
+            if self._mission_task is current_task:
+                self._mission_task = None
+
+    async def _run_measured_turn(self) -> None:
+        if self.heading_provider is None:
+            raise RuntimeCommandError("fresh Go2 heading is unavailable")
+        initial = self.heading_provider.status()
+        if not initial.healthy or initial.yaw_rad is None:
+            raise RuntimeCommandError("fresh Go2 heading is unavailable")
+        async with self._state_lock:
+            self._mission.phase = MissionPhase.TURNING
+            self._mission.reason = "measured_180_degree_turn"
+            self._mission.turn_progress_rad = 0.0
+        if self.mission_config.direct_turn_enabled:
+            await self._direct_turn_arm()
+        else:
+            await self.navigation_arm(NAVIGATION_ARM_CONFIRMATION)
+        direction = 1.0
+        turn_started = time.monotonic()
+        deadline = turn_started + self.mission_config.turn_timeout_s
+        last_log_at = 0.0
+        print(
+            "turn event=start "
+            f"initial_yaw_rad={initial.yaw_rad:.4f} "
+            f"command_yaw_rps={direction * self.mission_config.turn_rate_rps:.3f} "
+            f"target_deg={math.degrees(self.mission_config.turn_angle_rad):.1f} "
+            f"timeout_s={self.mission_config.turn_timeout_s:.2f} "
+            f"mode={'direct_yaw' if self.mission_config.direct_turn_enabled else 'avoidance'}",
+            flush=True,
+        )
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            sample = self.heading_provider.status()
+            if not sample.healthy or sample.yaw_rad is None:
+                raise RuntimeCommandError("Go2 heading became stale during turn")
+            progress = directed_progress(initial.yaw_rad, sample.yaw_rad, direction)
+            async with self._state_lock:
+                self._mission.turn_progress_rad = progress
+            if (
+                progress
+                >= self.mission_config.turn_angle_rad
+                - self.mission_config.turn_tolerance_rad
+            ):
+                print(
+                    "turn event=complete "
+                    f"elapsed_s={now - turn_started:.3f} "
+                    f"current_yaw_rad={sample.yaw_rad:.4f} "
+                    f"progress_deg={math.degrees(progress):.1f}",
+                    flush=True,
+                )
+                await self.stop("demo_turn_complete")
+                return
+            elapsed = now - turn_started
+            if (
+                self.mission_config.direct_turn_enabled
+                and elapsed >= self.mission_config.turn_stall_timeout_s
+                and progress < self.mission_config.turn_stall_min_progress_rad
+            ):
+                print(
+                    "turn event=stalled "
+                    f"elapsed_s={elapsed:.3f} "
+                    f"current_yaw_rad={sample.yaw_rad:.4f} "
+                    f"progress_deg={math.degrees(progress):.1f}",
+                    flush=True,
+                )
+                raise RuntimeCommandError(
+                    "direct turn stalled at "
+                    f"{math.degrees(progress):.1f} degrees"
+                )
+            if self.mission_config.direct_turn_enabled:
+                await self._direct_turn_command(
+                    direction * self.mission_config.turn_rate_rps
+                )
+            else:
+                await self.navigation_command(
+                    0.0, direction * self.mission_config.turn_rate_rps
+                )
+            if now - last_log_at >= 0.25:
+                last_log_at = now
+                motion_status = None if self.motion is None else self.motion.status()
+                print(
+                    "turn event=progress "
+                    f"elapsed_s={elapsed:.3f} "
+                    f"current_yaw_rad={sample.yaw_rad:.4f} "
+                    f"progress_deg={math.degrees(progress):.1f} "
+                    f"command_yaw_rps={direction * self.mission_config.turn_rate_rps:.3f} "
+                    f"motion_armed={None if motion_status is None else motion_status['armed']} "
+                    f"motion_mode={None if motion_status is None else motion_status['mode']}",
+                    flush=True,
+                )
+            await asyncio.sleep(0.05)
+        final = self.heading_provider.status()
+        print(
+            "turn event=timeout "
+            f"elapsed_s={time.monotonic() - turn_started:.3f} "
+            f"current_yaw_rad={final.yaw_rad} "
+            f"progress_deg={math.degrees(self._mission.turn_progress_rad):.1f}",
+            flush=True,
+        )
+        raise RuntimeCommandError("measured turn timed out")
+
+    async def _search_for_memory(self) -> CandidateMatch:
+        if self.heading_provider is None:
+            raise RuntimeCommandError("fresh Go2 heading is unavailable")
+        initial = self.heading_provider.status()
+        if not initial.healthy or initial.yaw_rad is None:
+            raise RuntimeCommandError("fresh Go2 heading is unavailable")
+        async with self._state_lock:
+            self._mission.phase = MissionPhase.SEARCHING
+            self._mission.reason = "searching_for_different_fruit"
+            self._mission.match_confirmations = 0
+            self._mission.match_failures = 0
+        await self.navigation_arm(NAVIGATION_ARM_CONFIRMATION)
+        deadline = time.monotonic() + self.mission_config.search_timeout_s
+        last_frame_id: int | None = None
+        last_center: tuple[int, int] | None = None
+        confirmations = 0
+        direction = 1.0
+        while time.monotonic() < deadline:
+            result, frame_id = await self._match_latest_frame(last_frame_id)
+            if frame_id is not None and frame_id != last_frame_id:
+                last_frame_id = frame_id
+                accepted = bool(result is not None and result.accepted and result.best)
+                if accepted and result is not None and result.best is not None:
+                    center = result.best.detection.center
+                    box = result.best.detection.bbox_xyxy
+                    width = max(1, box[2] - box[0])
+                    stable_candidate = bool(
+                        last_center is None
+                        or math.hypot(
+                            center[0] - last_center[0], center[1] - last_center[1]
+                        )
+                        <= max(90.0, width * 1.75)
+                    )
+                    confirmations = confirmations + 1 if stable_candidate else 1
+                    last_center = center
+                else:
+                    confirmations = 0
+                    last_center = None
+                async with self._state_lock:
+                    self._mission.last_match = (
+                        None if result is None else result.to_dict()
+                    )
+                    self._mission.match_confirmations = confirmations
+                    self._mission.match_failures = (
+                        0 if accepted else self._mission.match_failures + 1
+                    )
+                if result is not None:
+                    print(
+                        "search event=match "
+                        f"accepted={accepted} "
+                        f"reason={result.reason} "
+                        f"confirmations={confirmations} "
+                        f"candidate_count={result.candidate_count} "
+                        f"best_score={None if result.best is None else result.best.score}",
+                        flush=True,
+                    )
+                if (
+                    accepted
+                    and result is not None
+                    and result.best is not None
+                    and confirmations
+                    >= self.mission_config.match_confirmations_required
+                ):
+                    await self.stop("demo_match_locked")
+                    return result.best
+                if accepted:
+                    # Freeze the camera view as soon as a plausible different
+                    # fruit appears. Continuing the sweep while waiting for
+                    # another inference pushed live candidates out of frame.
+                    await self.navigation_command(0.0, 0.0)
+                    await asyncio.sleep(0.05)
+                    continue
+
+            sample = self.heading_provider.status()
+            if not sample.healthy or sample.yaw_rad is None:
+                raise RuntimeCommandError("Go2 heading became stale during search")
+            progress = directed_progress(initial.yaw_rad, sample.yaw_rad, direction)
+            if progress >= self.mission_config.search_sweep_rad:
+                raise RuntimeCommandError("different fruit not found in search sweep")
+            await self.navigation_command(
+                0.0, direction * self.mission_config.search_rate_rps
+            )
+            await asyncio.sleep(0.05)
+        raise RuntimeCommandError("different fruit search timed out")
+
+    async def _start_memory_approach(self, match: CandidateMatch) -> None:
+        async with self._state_lock:
+            memory = self._fruit_memory
+            self._mission.phase = MissionPhase.CONFIRMING
+            self._mission.reason = "locking_different_fruit_track"
+        if memory is None:
+            raise RuntimeCommandError("saved fruit memory disappeared")
+        # The search stage already required several consecutive, spatially
+        # stable instance matches. Preserve that evidence across the handoff
+        # instead of resetting the target to one visible frame and waiting for
+        # another full detector cycle. On Jetson, that redundant wait created
+        # a race where the follow request could cancel itself before arming.
+        confirmed_frames = max(
+            self.controller.config.stable_frames_required,
+            self.mission_config.match_confirmations_required,
+        )
+        print(
+            "approach event=target_lock "
+            f"label={memory.label} "
+            f"center={match.detection.center} "
+            f"confirmed_frames={confirmed_frames} "
+            f"match_score={match.score:.4f}",
+            flush=True,
+        )
+        await self.select_target(
+            memory.label,
+            match.detection.center,
+            confirmed_visible_frames=confirmed_frames,
+        )
+        await self.start_follow(ARM_CONFIRMATION)
+        async with self._state_lock:
+            self._mission.phase = MissionPhase.APPROACHING
+            self._mission.reason = "approaching_different_fruit"
+            self._mission.match_failures = 0
+
+    async def _monitor_memory_approach(self) -> None:
+        deadline = (
+            time.monotonic()
+            + self.controller.config.forward_budget_s
+            + 4.0
+        )
+        last_frame_id: int | None = None
+        failures = 0
+        near_target_seen = False
+        while time.monotonic() < deadline:
+            async with self._state_lock:
+                memory = self._fruit_memory
+                frame = self._produce_frame
+                frame_id = self._produce_frame_id
+                detections = list(self._produce_detections)
+                target = self._target
+                selected_name = self._selected_target_name
+                frame_width = self._frame_width
+                frame_height = None if self._latest_frame is None else self._latest_frame.height
+                follow_active = bool(
+                    self._follow_task is not None
+                    and not self._follow_task.done()
+                    and self._lease is not None
+                    and self.motion is not None
+                    and self.motion.armed
+                )
+                command_reason = self._command.reason
+            if memory is None:
+                raise RuntimeCommandError("saved fruit memory disappeared")
+            if target is not None and frame_height:
+                x, y, width, height = target.bbox_xywh
+                bottom_ratio = (y + height) / frame_height
+                center_ratio = target.center[1] / frame_height
+                if (
+                    bottom_ratio >= self.mission_config.near_bottom_ratio
+                    and center_ratio >= self.mission_config.near_center_ratio
+                ):
+                    near_target_seen = True
+                    async with self._state_lock:
+                        self._mission.near_target_seen = True
+
+            if frame is not None and frame_id is not None and frame_id != last_frame_id:
+                last_frame_id = frame_id
+                result = await asyncio.to_thread(
+                    self.instance_matcher.rank_different,
+                    memory,
+                    frame.bgr.copy(),
+                    detections,
+                )
+                associated = False
+                if result.accepted and result.best is not None and target is not None:
+                    candidate_center = result.best.detection.center
+                    associated = math.hypot(
+                        candidate_center[0] - target.center[0],
+                        candidate_center[1] - target.center[1],
+                    ) <= max(90.0, target.bbox_xywh[2] * 1.75)
+                failures = 0 if associated else failures + 1
+                async with self._state_lock:
+                    self._mission.last_match = result.to_dict()
+                    self._mission.match_failures = failures
+                if near_target_seen and result.best is None:
+                    await self._finish_demo_success(
+                        "different_fruit_reached_camera_edge"
+                    )
+                    return
+                if failures >= self.mission_config.approach_misses_allowed:
+                    raise RuntimeCommandError("different fruit identity lost during approach")
+
+            if selected_name is None:
+                if near_target_seen:
+                    await self._finish_demo_success("different_fruit_reached_camera_edge")
+                    return
+                raise RuntimeCommandError("different fruit lost before arrival")
+            if not follow_active:
+                if near_target_seen and command_reason in {
+                    "selected_target_not_revalidated",
+                    "selected_target_lost",
+                    "forward_budget_complete",
+                }:
+                    await self._finish_demo_success("different_fruit_reached_camera_edge")
+                    return
+                raise RuntimeCommandError(f"approach stopped: {command_reason}")
+            if frame_width is None:
+                raise RuntimeCommandError("camera geometry unavailable during approach")
+            await asyncio.sleep(0.025)
+        raise RuntimeCommandError("saved fruit approach timed out")
+
+    async def _finish_demo_success(self, reason: str) -> None:
+        await self.stop("demo_success")
+        async with self._state_lock:
+            self._mission.phase = MissionPhase.SUCCESS
+            self._mission.reason = reason
+
+    async def _match_latest_frame(
+        self, last_frame_id: int | None
+    ) -> tuple[MatchResult | None, int | None]:
+        async with self._state_lock:
+            memory = self._fruit_memory
+            frame = self._produce_frame
+            frame_id = self._produce_frame_id
+            detections = list(self._produce_detections)
+            produce_age = (
+                None
+                if self._produce_last_at is None
+                else time.monotonic() - self._produce_last_at
+            )
+        if (
+            memory is None
+            or frame is None
+            or frame_id is None
+            or frame_id == last_frame_id
+            or produce_age is None
+            or produce_age > self.maximum_produce_age_s
+        ):
+            return None, frame_id
+        result = await asyncio.to_thread(
+            self.instance_matcher.rank_different,
+            memory,
+            frame.bgr.copy(),
+            detections,
+        )
+        return result, frame_id
 
     async def _follow_loop(self) -> None:
         current_task = asyncio.current_task()

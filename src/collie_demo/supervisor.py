@@ -12,6 +12,23 @@ import urllib.error
 import urllib.request
 
 
+def process_probe_ok(status_code: int, payload: object) -> bool:
+    """Return true when the child API is alive, even if sensors are degraded.
+
+    ``stage_ready`` is an operator/motion gate, not a process-health signal.
+    Restarting the process whenever a GPU inference briefly ages out destroys
+    the in-memory fruit reference and can interrupt a measured turn. The child
+    runtime already emergency-stops on stale camera/target data; this outer
+    watchdog is only responsible for a dead or unreachable child process.
+    """
+
+    return (
+        status_code == 200
+        and isinstance(payload, dict)
+        and payload.get("ok") is True
+    )
+
+
 def emergency_brake() -> None:
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
     from unitree_sdk2py.go2.sport.sport_client import SportClient
@@ -52,7 +69,7 @@ def main() -> None:
         try:
             with urllib.request.urlopen(url, timeout=0.5) as response:
                 payload = json.load(response)
-                probe_ok = response.status == 200 and payload.get("stage_ready") is True
+                probe_ok = process_probe_ok(response.status, payload)
         except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
             probe_ok = False
         if probe_ok:

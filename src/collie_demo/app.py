@@ -81,6 +81,39 @@ def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
         except RuntimeCommandError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/api/memory/capture")
+    async def capture_memory(request: TargetRequest) -> dict[str, object]:
+        try:
+            return await runtime.remember_target(request.target, request.center)
+        except RuntimeCommandError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.delete("/api/memory")
+    async def clear_memory() -> dict[str, object]:
+        return await runtime.clear_memory()
+
+    @app.get("/api/memory/reference.jpg")
+    async def memory_reference() -> Response:
+        jpeg = await runtime.memory_reference_jpeg()
+        if jpeg is None:
+            raise HTTPException(status_code=404, detail="no fruit is saved")
+        return Response(
+            jpeg,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/demo/start")
+    async def start_demo(request: ArmRequest) -> dict[str, object]:
+        try:
+            return await runtime.start_demo(request.confirmation)
+        except RuntimeCommandError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/demo/stop")
+    async def stop_demo() -> dict[str, object]:
+        return await runtime.stop_demo()
+
     @app.post("/api/pulse")
     async def pulse() -> dict[str, object]:
         try:

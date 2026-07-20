@@ -1,8 +1,9 @@
 """Exclusive, watchdog-protected Unitree motion boundary.
 
-Adapted from go2-follow-clean. Non-zero commands only use Unitree's factory
-ObstaclesAvoidClient. SportClient is reserved for the independent StopMove
-brake; there is no direct SportClient.Move fallback.
+Adapted from go2-follow-clean. Translational commands only use Unitree's
+factory ObstaclesAvoidClient. A separately armed, yaw-only lease may use
+SportClient.Move for an in-place turn; that mode cannot accept translation and
+shares the same watchdog and independent StopMove brake.
 """
 
 from __future__ import annotations
@@ -33,6 +34,8 @@ class LeaseMismatch(MotionError):
 class SportClientProtocol(Protocol):
     def SetTimeout(self, timeout_s: float) -> Any: ...
     def Init(self) -> Any: ...
+    def BalanceStand(self) -> int: ...
+    def Move(self, vx: float, vy: float, vyaw: float) -> int: ...
     def StopMove(self) -> int: ...
 
 
@@ -71,6 +74,7 @@ class UnitreeMotionAdapter:
         self._initialized = False
         self._fault: str | None = None
         self._lease: str | None = None
+        self._mode: str | None = None
         self._avoidance_enabled = False
         self._remote_api_enabled = False
         self._last_verify_at: float | None = None
@@ -80,18 +84,17 @@ class UnitreeMotionAdapter:
 
     @property
     def armed(self) -> bool:
-        return bool(
-            self._initialized
-            and self._fault is None
-            and self._lease
-            and self._avoidance_enabled
-            and self._remote_api_enabled
-        )
+        if not self._initialized or self._fault is not None or not self._lease:
+            return False
+        if self._mode == "avoidance":
+            return self._avoidance_enabled and self._remote_api_enabled
+        return self._mode == "direct_yaw"
 
     def status(self) -> dict[str, object]:
         return {
             "initialized": self._initialized,
             "armed": self.armed,
+            "mode": self._mode,
             "fault": self._fault,
             "avoidance_required": True,
             "avoidance_enabled": self._avoidance_enabled,
@@ -138,14 +141,43 @@ class UnitreeMotionAdapter:
                 await self._release_locked(use_stop=True)
                 raise MotionNotReady(f"arm failed: {exc}") from exc
             self._lease = secrets.token_urlsafe(32)
+            self._mode = "avoidance"
             self._last_command = VelocityCommand(reason="armed_zero")
+            return self._lease
+
+    async def arm_direct_yaw(self) -> str:
+        """Acquire an exclusive SportClient lease that permits yaw only."""
+
+        async with self._lock:
+            self._require_ready()
+            if self._lease is not None:
+                raise MotionNotReady("motion lease already active")
+            try:
+                # Ensure the factory-avoidance API is not concurrently holding
+                # the motion channel before handing yaw control to SportClient.
+                await self._success(self.avoidance.UseRemoteCommandFromApi, False)
+                await self._success(self.avoidance.SwitchSet, False)
+                await self._success(self.sport.StopMove)
+                # StopMove clears velocity but does not guarantee that the
+                # high-level gait will accept the next Move. Explicitly enter
+                # locomotion-ready BalanceStand before direct yaw.
+                await self._success(self.sport.BalanceStand)
+            except Exception as exc:
+                await self._release_locked(use_stop=True)
+                raise MotionNotReady(f"direct yaw arm failed: {exc}") from exc
+            self._avoidance_enabled = False
+            self._remote_api_enabled = False
+            self._last_verify_at = None
+            self._lease = secrets.token_urlsafe(32)
+            self._mode = "direct_yaw"
+            self._last_command = VelocityCommand(reason="direct_yaw_armed_zero")
             return self._lease
 
     async def send(self, lease: str, command: VelocityCommand) -> VelocityCommand:
         forward = self._bounded_forward(command.forward_mps)
         yaw = self._bounded_yaw(command.yaw_rps)
         async with self._lock:
-            self._require_owner(lease)
+            self._require_owner(lease, required_mode="avoidance")
             # A fresh command has arrived. Do not let the previous command's
             # watchdog race the in-flight avoidance verification/Move RPC.
             # Each RPC remains bounded by rpc_timeout_s and faults to StopMove.
@@ -163,6 +195,26 @@ class UnitreeMotionAdapter:
                 self._arm_watchdog()
             else:
                 self._cancel_watchdog()
+            return self._last_command
+
+    async def send_direct_yaw(
+        self, lease: str, yaw_rps: float, reason: str = "direct_yaw"
+    ) -> VelocityCommand:
+        """Send a watchdog-protected SportClient turn with zero translation."""
+
+        yaw = self._bounded_yaw(yaw_rps)
+        async with self._lock:
+            self._require_owner(lease, required_mode="direct_yaw")
+            self._cancel_watchdog()
+            try:
+                await self._success(self.sport.Move, 0.0, 0.0, yaw)
+            except Exception as exc:
+                self._fault = f"direct yaw command failed: {exc}"
+                await self._release_locked(use_stop=True)
+                raise MotionNotReady(self._fault) from exc
+            self._last_command = VelocityCommand(0.0, yaw, reason)
+            if yaw != 0.0:
+                self._arm_watchdog()
             return self._last_command
 
     async def release(self, lease: str) -> None:
@@ -229,6 +281,7 @@ class UnitreeMotionAdapter:
             except Exception as exc:
                 errors.append(f"{label}: {exc}")
         self._lease = None
+        self._mode = None
         self._avoidance_enabled = False
         self._remote_api_enabled = False
         self._last_verify_at = None
@@ -241,12 +294,16 @@ class UnitreeMotionAdapter:
         if self._fault is not None:
             raise MotionNotReady(self._fault)
 
-    def _require_owner(self, lease: str) -> None:
+    def _require_owner(self, lease: str, *, required_mode: str | None = None) -> None:
         self._require_ready()
         if not self.armed:
             raise MotionNotReady("motion is disarmed")
         if not isinstance(lease, str) or self._lease is None or not secrets.compare_digest(lease, self._lease):
             raise LeaseMismatch("motion lease is stale or does not match")
+        if required_mode is not None and self._mode != required_mode:
+            raise MotionNotReady(
+                f"motion lease mode is {self._mode!r}, expected {required_mode!r}"
+            )
 
     def _arm_watchdog(self) -> None:
         self._cancel_watchdog()

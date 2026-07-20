@@ -41,6 +41,26 @@ class FakeRuntime:
             "follow_active": True,
         }
 
+    async def remember_target(
+        self, target: str, center: tuple[int, int] | None = None
+    ) -> dict[str, object]:
+        self.selected = target
+        self.center = center
+        return {"memory": {"id": "round-1", "label": target}}
+
+    async def clear_memory(self) -> dict[str, object]:
+        self.selected = None
+        return {"memory": None}
+
+    async def memory_reference_jpeg(self) -> bytes:
+        return b"reference-jpeg"
+
+    async def start_demo(self, confirmation: str) -> dict[str, object]:
+        return {"mission": {"active": True}, "confirmation": confirmation}
+
+    async def stop_demo(self) -> dict[str, object]:
+        return {"mission": {"active": False}}
+
     async def navigation_status(self) -> dict[str, object]:
         return {"available": True, "armed": False}
 
@@ -109,3 +129,25 @@ def test_navigation_motion_endpoints_are_separate_from_fruit_follow(
             "yaw_rps": -0.2,
         }
         assert client.post("/api/navigation/stop").json()["armed"] is False
+
+
+def test_memory_and_demo_endpoints_are_local_and_explicit(tmp_path: Path) -> None:
+    (tmp_path / "index.html").write_text("ok")
+    runtime = FakeRuntime()
+
+    with TestClient(create_app(runtime, tmp_path)) as client:  # type: ignore[arg-type]
+        saved = client.post(
+            "/api/memory/capture",
+            json={"target": "pear", "center": [300, 400]},
+        )
+        assert saved.status_code == 200
+        assert saved.json()["memory"]["label"] == "pear"
+        assert client.get("/api/memory/reference.jpg").content == b"reference-jpeg"
+        started = client.post(
+            "/api/demo/start",
+            json={"confirmation": "TARGET SAVED AND AREA CLEAR"},
+        )
+        assert started.status_code == 200
+        assert started.json()["mission"]["active"] is True
+        assert client.post("/api/demo/stop").json()["mission"]["active"] is False
+        assert client.delete("/api/memory").json()["memory"] is None

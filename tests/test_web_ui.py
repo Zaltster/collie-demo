@@ -61,3 +61,17 @@ def test_stage_health_is_visible_in_the_ui() -> None:
     assert "WAITING FOR YOLO" in html
     assert "WAITING FOR FRESH FRAME" in html
     assert "s.follow_readiness" in html
+
+
+def test_memory_demo_ui_keeps_stop_and_manual_fallback() -> None:
+    html = (Path(__file__).parents[1] / "web" / "index.html").read_text()
+
+    assert "SAVE FRUIT" in html
+    assert "RUN REMEMBER & FIND" in html
+    assert "direct yaw" in html
+    assert "await api('/api/memory/capture',{target:name,center})" in html
+    assert "await api('/api/demo/start',{confirmation:'TARGET SAVED AND AREA CLEAR'})" in html
+    assert "await remove('/api/memory')" in html
+    assert "Manual follower fallback" in html
+    assert 'id="stop"' in html
+    assert "following||demoActive||startingFollow||startingDemo" in html

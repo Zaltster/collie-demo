@@ -1,7 +1,9 @@
 # Collie Demo
 
-A self-contained Wendy app for Woof that lets an operator select a locally
-detected apple, banana, or pear and safely follow that exact object. It uses a
+A self-contained Wendy app for Woof that can remember a locally detected fruit,
+turn around, reject that physical prop, and safely approach a different instance
+of the same fruit class. The
+validated manual apple/banana/pear follower remains available as a fallback. It uses a
 YOLOE-11m checkpoint whose visual prompt embeddings were baked from the three
 physical stage props.
 Frames come directly from Unitree's public `VideoClient`; inference,
@@ -55,6 +57,34 @@ or internet connection is used at runtime.
   and motion adapter. The UI displays verification age and the current miss
   count, and the out-of-process supervisor brakes/restarts if readiness remains
   unhealthy.
+- `Save Fruit` captures five detector-aligned appearance embeddings while motion
+  remains disarmed. The per-round memory is local to the robot process and is
+  cleared only by `Reset Round`, a replacement capture, or service restart.
+- Keeps persistent fruit memory separate from the ephemeral visual track. A
+  normal target-loss stop therefore cannot erase what Woof was shown before it
+  turned around.
+- Uses fresh `rt/sportmodestate` IMU yaw to measure the turn. The mission refuses
+  to start or aborts if heading becomes stale; it never estimates a 180-degree
+  turn from elapsed time alone.
+- Runs the initial measured turn through an exclusive yaw-only `SportClient`
+  lease, with forward and lateral motion structurally fixed at zero. This turn
+  explicitly enters `BalanceStand`, commands a 0.80 rad/s yaw, and aborts if it
+  has not rotated at least 10 degrees within two seconds. It does not use
+  `ObstaclesAvoidClient`, but it retains the 350 ms heartbeat
+  watchdog and independent `StopMove` brake. After the turn, the direct lease is
+  released and search/approach reacquire the factory-avoidance motion path.
+- Ranks every same-class YOLO candidate against the saved appearance using local
+  color, texture, and shape embeddings. Candidates at or above 94% saved-instance
+  similarity are rejected. The stage build requires two fresh confirmations of
+  a candidate below that threshold before moving forward. Search rotation brakes
+  on the first accepted candidate so the next inference confirms a stationary
+  view instead of rotating the fruit out of frame.
+- Runs `TURNING -> SEARCHING -> CONFIRMING -> APPROACHING` inside the robot
+  service. UI refresh timing cannot interrupt command renewal, and leaving the
+  page sends the same emergency stop used by the manual follower.
+- Treats disappearance as success only after the matched fruit reached the
+  lower camera region. Earlier loss or an ambiguous appearance match is an
+  abort with zero commanded velocity.
 
 Every class emitted by the local model is selectable from the detection list.
 Whale color detection and whale motion targets have been removed.
@@ -150,3 +180,25 @@ The stage control sequence is: click `Select` beside the exact fruit, wait for
 the Follow button to enable, then click `Follow Selected Fruit` once. `STOP
 NOW` remains available throughout motion. Do not run the demo unless the header
 shows `STAGE READY`.
+
+## Remember-and-find stage sequence
+
+1. Hold one detected fruit steady and press `Save Fruit` on that detection.
+2. Confirm the saved reference image and the `MEMORIZED` mission state.
+3. Put a different instance of the same fruit class in the search area behind
+   Woof. The shown fruit is a negative reference and will be rejected if seen.
+   Clear the full turn and approach path.
+4. Press `Run Remember & Find` once. Woof performs a heading-measured turn,
+   requires a multi-frame different-instance lock, and then hands the target to the
+   existing guarded follower.
+5. Use `STOP NOW` at any time. `Reset Round` erases the saved instance.
+
+The mission endpoints are `POST /api/memory/capture`, `DELETE /api/memory`,
+`GET /api/memory/reference.jpg`, `POST /api/demo/start`, and
+`POST /api/demo/stop`. `/api/status` reports `memory`, `mission`, heading age,
+match score/margin, turn progress, and the terminal reason.
+
+The feature is controlled by `COLLIE_MEMORY_DEMO_ENABLED` and
+`COLLIE_AUTONOMOUS_TURN_ENABLED`. Matching, turn speed/angle, search limits,
+and arrival geometry are environment-configurable in the Dockerfile. Disabling
+either feature does not remove or weaken the manual follower and STOP path.
