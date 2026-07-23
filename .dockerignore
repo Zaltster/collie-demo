@@ -11,3 +11,4 @@ models/snapstock/*
 !models/collie/
 models/collie/*
 !models/collie/collie-fruit-yoloe11m.pt
+!models/collie/collie-fruit-yoloe11m.engine

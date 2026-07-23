@@ -1,11 +1,13 @@
 # Collie Demo
 
-A self-contained Wendy app for Woof that can remember a locally detected fruit,
-turn around, reject that physical prop, and safely approach a different instance
-of the same fruit class. The
+A self-contained Wendy app for Woof that can save a locally detected fruit class,
+turn around, recognize a fresh fruit of that class, safely approach it, and return
+to its saved start pose. The
 validated manual apple/banana/pear follower remains available as a fallback. It uses a
 YOLOE-11m checkpoint whose visual prompt embeddings were baked from the three
-physical stage props.
+physical stage props. The Woof image runs a TensorRT 10.7 FP16 engine exported
+on its Orin; the original PyTorch checkpoint remains in the image as the source
+artifact.
 Frames come directly from Unitree's public `VideoClient`; inference,
 annotation, motion supervision, and the browser UI all run locally in the
 robot container. No Roboflow service, hosted inference API, Hugging Face key,
@@ -13,12 +15,17 @@ or internet connection is used at runtime.
 
 ## Current behavior
 
-- Loads `models/collie/collie-fruit-yoloe11m.pt` locally.
+- Bundles the local PyTorch source checkpoint and Woof-specific TensorRT FP16
+  engine; runtime inference does not call a hosted API.
 - Detects only the three visual-prompt classes: apple, banana, and pear.
+- Runs the Orin-specific `collie-fruit-yoloe11m.engine` with the model task
+  explicitly set to `segment`; this is required because a serialized TensorRT
+  engine cannot reliably infer its Ultralytics task from the filename.
 - Draws labels, confidence scores, bounding boxes, and box centers.
 - Prints every detection to the container log.
-- Serves the annotated Go2 camera and structured detections on port 8096.
-- Uses tested per-class thresholds: apple 80%, banana 20%, and pear 80%.
+- Serves a low-latency Go2 MJPEG stream with browser-rendered detection boxes,
+  plus the legacy annotated snapshot and structured detections on port 8096.
+- Uses per-class confidence thresholds: apple 70%, banana 20%, and pear 70%.
   The lower banana threshold preserves detection as the robot closes in; the
   60-frame close-view live set scored 28.1-45.5%, the benchmark had no banana
   false positives even at 5%, and three historical non-target frames stayed
@@ -55,36 +62,93 @@ or internet connection is used at runtime.
   `/api/status`.
 - Reports aggregate `stage_ready` health for the camera, YOLO worker, CUDA GPU,
   and motion adapter. The UI displays verification age and the current miss
-  count, and the out-of-process supervisor brakes/restarts if readiness remains
-  unhealthy.
-- `Save Fruit` captures five detector-aligned appearance embeddings while motion
-  remains disarmed. The per-round memory is local to the robot process and is
+  count. The out-of-process supervisor monitors process reachability; degraded
+  sensor readiness remains a fail-closed motion gate inside the child runtime.
+- Assigns every explicit fruit selection a process-scoped `runtime_id` and a
+  monotonically increasing `target_lock_id`. Remote voice/UI clients must
+  revalidate both values before starting the bounded follower.
+- Preserves a disarmed user's fruit choice through brief camera or detector
+  gaps while immediately removing motion readiness. The same lock can recover
+  only after fresh YOLO reacquisition; an active follower still clears and
+  stops on the bounded loss rule.
+- Gives CUDA/model initialization a 60-second supervisor grace period so the
+  cold first inference cannot create a false restart loop. A child that exits
+  still fails immediately. After warm-up, 80 consecutive failed probes
+  (roughly 60 seconds including request timeouts) trigger the independent
+  emergency brake and restart path, while brief Jetson inference stalls only
+  close the fail-safe motion readiness gate.
+- `Save Class` stores the selected YOLO label and one reference crop for the UI
+  while motion remains disarmed. The per-round class target is local to the robot process and is
   cleared only by `Reset Round`, a replacement capture, or service restart.
+- After a successful save, Woof performs Unitree's stock `Hello` paw-forward
+  gesture once. The gesture holds the exclusive motion boundary, keeps factory
+  avoidance and translational control disarmed, and must finish before the
+  turn/search mission can start. Set `COLLIE_INITIAL_HELLO_ENABLED=0` to disable
+  the acknowledgement without changing fruit memory behavior.
+- After Woof confirms the saved fruit class, it releases the search-motion lease
+  and performs Unitree's stock `Stretch` once. It waits for the animation to
+  settle, remains motion-disarmed, and requires several fresh detections of the saved class
+  before presenting an explicit `Go to Fruit` button. Woof remains stopped and
+  disarmed until that button is pressed, then requires another set of fresh
+  same-class detections before it can arm the guarded approach. If the fruit
+  moved or disappeared during the stretch or operator pause, the mission aborts
+  instead of walking toward stale image coordinates. Stretch itself is cosmetic:
+  an RPC failure is reported in mission telemetry but cannot abort a valid class
+  lock. `COLLIE_SKILL_TIMEOUT_S` and `COLLIE_CLIENT_TIMEOUT_S` default to 12
+  seconds so long-running stock animations are not misreported as timeouts. Set
+  `COLLIE_MATCH_STRETCH_ENABLED=0` to skip the gesture;
+  `COLLIE_MATCH_STRETCH_SETTLE_S` and `COLLIE_MATCH_REACQUIRE_TIMEOUT_S` control
+  the animation wait and fresh-frame reacquisition window.
+- After the fruit has reached the lower camera region and then disappears, Woof
+  first releases every locomotion owner and stops. It then performs the stock
+  `Hello` paw-forward gesture as a visible arrival acknowledgement before
+  return-home begins. Early target loss never triggers this gesture. The action
+  is cosmetic and nonfatal: an SDK rejection is reported in mission telemetry,
+  but Woof remains stopped and continues through the safe return path. Set
+  `COLLIE_ARRIVAL_HELLO_ENABLED=0` to disable it; use
+  `COLLIE_ARRIVAL_HELLO_SETTLE_S` to control the stopped settling delay.
 - Keeps persistent fruit memory separate from the ephemeral visual track. A
   normal target-loss stop therefore cannot erase what Woof was shown before it
   turned around.
-- Uses fresh `rt/sportmodestate` IMU yaw to measure the turn. The mission refuses
-  to start or aborts if heading becomes stale; it never estimates a 180-degree
-  turn from elapsed time alone.
-- Runs the initial measured turn through an exclusive yaw-only `SportClient`
-  lease, with forward and lateral motion structurally fixed at zero. This turn
-  explicitly enters `BalanceStand`, commands a 0.80 rad/s yaw, and aborts if it
-  has not rotated at least 10 degrees within two seconds. It does not use
-  `ObstaclesAvoidClient`, but it retains the 350 ms heartbeat
-  watchdog and independent `StopMove` brake. After the turn, the direct lease is
-  released and search/approach reacquire the factory-avoidance motion path.
-- Ranks every same-class YOLO candidate against the saved appearance using local
-  color, texture, and shape embeddings. Candidates at or above 94% saved-instance
-  similarity are rejected. The stage build requires two fresh confirmations of
-  a candidate below that threshold before moving forward. Search rotation brakes
-  on the first accepted candidate so the next inference confirms a stationary
-  view instead of rotating the fruit out of frame.
-- Runs `TURNING -> SEARCHING -> CONFIRMING -> APPROACHING` inside the robot
+- Uses fresh `rt/sportmodestate` IMU yaw and local `(x, y)` odometry. The mission
+  refuses to start or aborts if heading or the position required for return-home
+  becomes stale; it never estimates a 180-degree turn or return distance from
+  elapsed time alone.
+- Runs the initial measured turn through the factory `ObstaclesAvoidClient`
+  path that has physically actuated Woof, with forward and lateral motion fixed
+  at zero. The controller confirms the avoidance switch, takes remote API
+  ownership, waits 0.5 seconds for that handoff to settle, then commands a
+  0.80 rad/s yaw. Fresh odometry measures the full turn; the 350 ms heartbeat
+  watchdog and independent `StopMove` brake remain active. The unused direct
+  `SportClient` path remains available behind `COLLIE_DIRECT_TURN_ENABLED`, but
+  it is disabled in the stage image because live commands were acknowledged
+  without producing physical yaw.
+- Selects the highest-confidence fresh YOLO detection whose label equals the
+  saved class, followed by two spatially stable confirmations before moving
+  forward. A different physical prop of the same class is intentionally valid.
+  Search rotation brakes on the first accepted class detection so the next
+  inference confirms a stationary view instead of rotating the fruit out of frame.
+  If the fruit is not immediately visible after the measured turn, search uses
+  accumulated wrap-safe yaw deltas for an explicit bounded 360-degree scan. It
+  never relies on a wrapped start/end heading comparison to spin until timeout.
+- Runs `TURNING -> SEARCHING -> CONFIRMING -> APPROACHING -> RETURNING_HOME`
+  inside the robot
   service. UI refresh timing cannot interrupt command renewal, and leaving the
   page sends the same emergency stop used by the manual follower.
-- Treats disappearance as success only after the matched fruit reached the
-  lower camera region. Earlier loss or an ambiguous appearance match is an
-  abort with zero commanded velocity.
+- Treats disappearance as success only after the selected fruit reached the
+  lower camera region. Earlier loss of the saved class is an abort with zero
+  commanded velocity. The stage profile currently approaches at 0.30 m/s for
+  at most 8 seconds and tolerates three consecutive detector misses; these
+  limits preserve the original 2.4 m reach while reducing distance travelled
+  between detector updates.
+- Captures Home from fresh local odometry when the operator starts the mission.
+  After the fruit is reached, the return controller uses the factory obstacle-
+  avoidance channel, turns toward Home, drives at up to 0.30 m/s, and restores
+  the original heading. It stops within a 25 cm position tolerance and aborts on
+  stale pose, a 45-second timeout, or less than 4 cm of translational progress
+  in six seconds. Those progress limits match the slower displacement observed
+  behind the factory avoidance controller while retaining a bounded fail-stop.
+  This is a short-range open-stage return controller, not a global map planner.
 
 Every class emitted by the local model is selectable from the detection list.
 Whale color detection and whale motion targets have been removed.
@@ -92,7 +156,7 @@ Whale color detection and whale motion targets have been removed.
 ## Model
 
 Download the official YOLOE base checkpoint, capture a clean reference frame,
-and bake the three exact props into a self-contained local checkpoint:
+and bake the three stage props into a self-contained local checkpoint:
 
 ```sh
 mkdir -p models/candidates models/collie
@@ -159,8 +223,8 @@ curl http://woof.local:8096/api/status
 ```
 
 Then open `http://woof.local:8096/`. A healthy status response must report the
-Collie YOLOE model path, `produce.class_thresholds` of `apple: 0.8`,
-`banana: 0.2`, and `pear: 0.8`, the selected fruit and its current observation,
+Collie YOLOE model path, `produce.class_thresholds` of `apple: 0.7`,
+`banana: 0.2`, and `pear: 0.7`, the selected fruit and its current observation,
 `produce.device.resolved: "cuda:0"`, motion state, and `ok: true`. In this
 stage configuration the model only returns apple, banana, and pear detections.
 
@@ -176,27 +240,37 @@ python tools/benchmark_fruit_models.py \
   --output captures/three-fruit-benchmark/results/collie-yoloe.json
 ```
 
-The stage control sequence is: click `Select` beside the exact fruit, wait for
+The stage UI uses `/camera-stream.mjpg`, a persistent stream that forwards the
+JPEG already supplied by Unitree instead of opening a new request and
+re-encoding every displayed frame. `/api/status` reports `camera_fps`, frame
+dimensions, frame age, and the independent YOLO inference time. Camera capture
+defaults to 30 Hz (`COLLIE_CAMERA_HZ`) while legacy annotated snapshots are
+limited to 5 Hz (`COLLIE_ANNOTATED_HZ`) so display fluidity is not gated by
+inference or full-resolution JPEG encoding.
+
+The stage control sequence is: click `Select` beside the desired detection, wait for
 the Follow button to enable, then click `Follow Selected Fruit` once. `STOP
 NOW` remains available throughout motion. Do not run the demo unless the header
 shows `STAGE READY`.
 
 ## Remember-and-find stage sequence
 
-1. Hold one detected fruit steady and press `Save Fruit` on that detection.
-2. Confirm the saved reference image and the `MEMORIZED` mission state.
-3. Put a different instance of the same fruit class in the search area behind
-   Woof. The shown fruit is a negative reference and will be rejected if seen.
-   Clear the full turn and approach path.
+1. Hold one detected fruit steady and press `Save Class` on that detection.
+2. Confirm the saved label and the `MEMORIZED` mission state.
+3. Place one fruit of that class in the search area behind Woof. Clear the turn,
+   approach, and return paths.
 4. Press `Run Remember & Find` once. Woof performs a heading-measured turn,
-   requires a multi-frame different-instance lock, and then hands the target to the
-   existing guarded follower.
-5. Use `STOP NOW` at any time. `Reset Round` erases the saved instance.
+   requires a multi-frame class lock, stretches, and stops at
+   `WAITING FOR GO`.
+5. Confirm the target and path are still clear, then press `Go to Fruit`. Woof
+   revalidates the saved class in fresh frames, hands it to the guarded follower,
+   and returns to the start pose using local odometry.
+6. Use `STOP NOW` at any time. `Reset Round` erases the saved class.
 
 The mission endpoints are `POST /api/memory/capture`, `DELETE /api/memory`,
 `GET /api/memory/reference.jpg`, `POST /api/demo/start`, and
-`POST /api/demo/stop`. `/api/status` reports `memory`, `mission`, heading age,
-match score/margin, turn progress, and the terminal reason.
+`POST /api/demo/go`, and `POST /api/demo/stop`. `/api/status` reports `memory`,
+`mission`, heading age, class-lock state, turn progress, and the terminal reason.
 
 The feature is controlled by `COLLIE_MEMORY_DEMO_ENABLED` and
 `COLLIE_AUTONOMOUS_TURN_ENABLED`. Matching, turn speed/angle, search limits,

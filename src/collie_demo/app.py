@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from .runtime import CollieRuntime, RuntimeCommandError
@@ -19,6 +19,10 @@ class TargetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     target: str
     center: tuple[int, int] | None = None
+
+
+class MemoryCaptureRequest(TargetRequest):
+    round_id: str | None = None
 
 
 class NavigationCommandRequest(BaseModel):
@@ -53,6 +57,32 @@ def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
             raise HTTPException(status_code=503, detail="no camera frame yet")
         return Response(jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
+    @app.get("/camera-stream.mjpg")
+    async def camera_stream() -> StreamingResponse:
+        async def frames():
+            last_frame_id = 0
+            while True:
+                packet = await runtime.wait_for_stream_frame(last_frame_id)
+                if packet is None:
+                    return
+                last_frame_id, jpeg = packet
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    + f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii")
+                    + jpeg
+                    + b"\r\n"
+                )
+
+        return StreamingResponse(
+            frames(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.get("/camera-raw.jpg")
     async def raw_camera() -> Response:
         jpeg = await runtime.raw_jpeg()
@@ -82,11 +112,19 @@ def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/memory/capture")
-    async def capture_memory(request: TargetRequest) -> dict[str, object]:
+    async def capture_memory(request: MemoryCaptureRequest) -> dict[str, object]:
         try:
-            return await runtime.remember_target(request.target, request.center)
+            return await runtime.remember_target(
+                request.target,
+                request.center,
+                expected_round_id=request.round_id,
+            )
         except RuntimeCommandError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/round/reset")
+    async def reset_round() -> dict[str, object]:
+        return await runtime.reset_round()
 
     @app.delete("/api/memory")
     async def clear_memory() -> dict[str, object]:
@@ -113,6 +151,13 @@ def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
     @app.post("/api/demo/stop")
     async def stop_demo() -> dict[str, object]:
         return await runtime.stop_demo()
+
+    @app.post("/api/demo/go")
+    async def approve_demo_go(request: ArmRequest) -> dict[str, object]:
+        try:
+            return await runtime.approve_demo_go(request.confirmation)
+        except RuntimeCommandError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/pulse")
     async def pulse() -> dict[str, object]:

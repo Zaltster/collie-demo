@@ -33,4 +33,8 @@ def test_camera_timestamp_is_taken_after_blocking_sdk_read(monkeypatch) -> None:
 
     assert frame.frame_id == 1
     assert frame.captured_monotonic_s == 123.5
+    assert frame.width == 16
+    assert frame.height == 12
+    assert frame._bgr is None
     assert frame.bgr.shape == image.shape
+    assert frame.source_jpeg == encoded.tobytes()

@@ -39,6 +39,7 @@ class FruitDetector:
         confidence: float = 0.5,
         class_thresholds: dict[str, float] | None = None,
         device: str | int | None = None,
+        task: str | None = None,
         model: Any | None = None,
     ) -> None:
         self.model_path = Path(model_path).expanduser().resolve()
@@ -59,10 +60,11 @@ class FruitDetector:
             [float(confidence), *normalized_thresholds.values()]
         )
         self.requested_device = device
+        self.task = task
         if model is None:
             from ultralytics import YOLO
 
-            model = YOLO(str(self.model_path))
+            model = YOLO(str(self.model_path), task=task)
         self.model = model
         names = getattr(model, "names", {})
         self.names = {
@@ -139,6 +141,7 @@ class FruitDetector:
             "requested": "auto"
             if self.requested_device is None
             else str(self.requested_device),
+            "task": self.task,
             "resolved": self._model_device(),
             "cuda_available": cuda_available,
             "cuda_version": cuda_version,
@@ -146,16 +149,27 @@ class FruitDetector:
         }
 
     def _model_device(self) -> str:
-        inner_model = getattr(self.model, "model", None)
-        direct_device = getattr(inner_model, "device", None)
-        if direct_device is not None:
-            return str(direct_device)
-        parameters = getattr(inner_model, "parameters", None)
-        if callable(parameters):
-            try:
-                return str(next(parameters()).device)
-            except (StopIteration, AttributeError, TypeError):
-                pass
+        # PyTorch checkpoints expose ``YOLO.model.device``. Serialized
+        # TensorRT engines keep ``YOLO.model`` as the engine path string and
+        # expose the real CUDA device through the lazily-created predictor's
+        # AutoBackend instead. Inspect both without special-casing the engine
+        # suffix so the stage GPU gate remains evidence-based.
+        predictor = getattr(self.model, "predictor", None)
+        candidates = (
+            getattr(self.model, "model", None),
+            getattr(predictor, "model", None),
+            predictor,
+        )
+        for candidate in candidates:
+            direct_device = getattr(candidate, "device", None)
+            if direct_device is not None:
+                return str(direct_device)
+            parameters = getattr(candidate, "parameters", None)
+            if callable(parameters):
+                try:
+                    return str(next(parameters()).device)
+                except (StopIteration, AttributeError, TypeError):
+                    pass
         return "unresolved"
 
 

@@ -27,6 +27,13 @@ class FakeRuntime:
     async def raw_jpeg(self) -> bytes:
         return b"raw-jpeg"
 
+    async def wait_for_stream_frame(
+        self, last_frame_id: int
+    ) -> tuple[int, bytes] | None:
+        if last_frame_id < 1:
+            return 1, b"stream-jpeg"
+        return None
+
     async def select_target(
         self, target: str, center: tuple[int, int] | None = None
     ) -> dict[str, object]:
@@ -42,11 +49,21 @@ class FakeRuntime:
         }
 
     async def remember_target(
-        self, target: str, center: tuple[int, int] | None = None
+        self,
+        target: str,
+        center: tuple[int, int] | None = None,
+        expected_round_id: str | None = None,
     ) -> dict[str, object]:
         self.selected = target
         self.center = center
-        return {"memory": {"id": "round-1", "label": target}}
+        return {
+            "memory": {"id": "round-1", "label": target},
+            "expected_round_id": expected_round_id,
+        }
+
+    async def reset_round(self) -> dict[str, object]:
+        self.selected = None
+        return {"round_id": "round-2", "memory": None}
 
     async def clear_memory(self) -> dict[str, object]:
         self.selected = None
@@ -60,6 +77,12 @@ class FakeRuntime:
 
     async def stop_demo(self) -> dict[str, object]:
         return {"mission": {"active": False}}
+
+    async def approve_demo_go(self, confirmation: str) -> dict[str, object]:
+        return {
+            "mission": {"active": True, "phase": "confirming"},
+            "confirmation": confirmation,
+        }
 
     async def navigation_status(self) -> dict[str, object]:
         return {"available": True, "armed": False}
@@ -104,6 +127,14 @@ def test_target_endpoint_selects_a_specific_detection(tmp_path: Path) -> None:
         assert follow.json()["follow_active"] is True
         assert client.get("/camera.jpg").content == b"annotated-jpeg"
         assert client.get("/camera-raw.jpg").content == b"raw-jpeg"
+        with client.stream("GET", "/camera-stream.mjpg") as stream:
+            assert stream.status_code == 200
+            assert stream.headers["content-type"].startswith(
+                "multipart/x-mixed-replace; boundary=frame"
+            )
+            payload = b"".join(stream.iter_bytes())
+        assert b"Content-Type: image/jpeg" in payload
+        assert b"stream-jpeg" in payload
 
 
 def test_navigation_motion_endpoints_are_separate_from_fruit_follow(
@@ -138,10 +169,11 @@ def test_memory_and_demo_endpoints_are_local_and_explicit(tmp_path: Path) -> Non
     with TestClient(create_app(runtime, tmp_path)) as client:  # type: ignore[arg-type]
         saved = client.post(
             "/api/memory/capture",
-            json={"target": "pear", "center": [300, 400]},
+            json={"target": "pear", "center": [300, 400], "round_id": "round-1"},
         )
         assert saved.status_code == 200
         assert saved.json()["memory"]["label"] == "pear"
+        assert saved.json()["expected_round_id"] == "round-1"
         assert client.get("/api/memory/reference.jpg").content == b"reference-jpeg"
         started = client.post(
             "/api/demo/start",
@@ -149,5 +181,14 @@ def test_memory_and_demo_endpoints_are_local_and_explicit(tmp_path: Path) -> Non
         )
         assert started.status_code == 200
         assert started.json()["mission"]["active"] is True
+        go = client.post(
+            "/api/demo/go",
+            json={"confirmation": "CLASS LOCKED AND PATH CLEAR"},
+        )
+        assert go.status_code == 200
+        assert go.json()["mission"]["phase"] == "confirming"
         assert client.post("/api/demo/stop").json()["mission"]["active"] is False
+        reset = client.post("/api/round/reset")
+        assert reset.status_code == 200
+        assert reset.json()["round_id"] == "round-2"
         assert client.delete("/api/memory").json()["memory"] is None

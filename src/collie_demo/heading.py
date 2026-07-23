@@ -1,4 +1,4 @@
-"""Fresh Go2 heading samples for measured autonomous turns."""
+"""Fresh Go2 local-pose samples for measured turns and short returns."""
 
 from __future__ import annotations
 
@@ -15,6 +15,20 @@ class HeadingSample:
     age_s: float | None
     healthy: bool
     error: str | None = None
+    x_m: float | None = None
+    y_m: float | None = None
+    position_healthy: bool = False
+    position_error: str | None = None
+
+    @property
+    def pose_healthy(self) -> bool:
+        return bool(
+            self.healthy
+            and self.position_healthy
+            and self.yaw_rad is not None
+            and self.x_m is not None
+            and self.y_m is not None
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -22,6 +36,11 @@ class HeadingSample:
             "age_s": None if self.age_s is None else round(self.age_s, 3),
             "healthy": self.healthy,
             "error": self.error,
+            "x_m": None if self.x_m is None else round(self.x_m, 4),
+            "y_m": None if self.y_m is None else round(self.y_m, 4),
+            "position_healthy": self.position_healthy,
+            "pose_healthy": self.pose_healthy,
+            "position_error": self.position_error,
         }
 
 
@@ -38,8 +57,11 @@ class SportModeHeadingProvider:
         self.maximum_age_s = float(maximum_age_s)
         self._lock = Lock()
         self._yaw_rad: float | None = None
+        self._x_m: float | None = None
+        self._y_m: float | None = None
         self._updated_at: float | None = None
         self._error: str | None = "waiting for rt/sportmodestate"
+        self._position_error: str | None = "waiting for local position"
         self._subscriber = None
 
     def start(self) -> None:
@@ -65,17 +87,37 @@ class SportModeHeadingProvider:
                 pass
         with self._lock:
             self._yaw_rad = None
+            self._x_m = None
+            self._y_m = None
             self._updated_at = None
 
     def status(self) -> HeadingSample:
         now = time.monotonic()
         with self._lock:
             yaw = self._yaw_rad
+            x_m = self._x_m
+            y_m = self._y_m
             updated = self._updated_at
             error = self._error
+            position_error = self._position_error
         age = None if updated is None else max(0.0, now - updated)
         healthy = yaw is not None and age is not None and age <= self.maximum_age_s
-        return HeadingSample(yaw, age, healthy, None if healthy else error)
+        position_healthy = bool(
+            x_m is not None
+            and y_m is not None
+            and age is not None
+            and age <= self.maximum_age_s
+        )
+        return HeadingSample(
+            yaw,
+            age,
+            healthy,
+            None if healthy else error,
+            x_m,
+            y_m,
+            position_healthy,
+            None if position_healthy else position_error,
+        )
 
     def _on_state(self, message: object) -> None:
         try:
@@ -87,10 +129,24 @@ class SportModeHeadingProvider:
             with self._lock:
                 self._error = f"invalid heading sample: {exc}"
             return
+        try:
+            position = getattr(message, "position")
+            x_m = float(position[0])
+            y_m = float(position[1])
+            if not math.isfinite(x_m) or not math.isfinite(y_m):
+                raise ValueError("non-finite local position")
+            position_error = None
+        except Exception as exc:
+            x_m = None
+            y_m = None
+            position_error = f"invalid local position sample: {exc}"
         with self._lock:
             self._yaw_rad = yaw
+            self._x_m = x_m
+            self._y_m = y_m
             self._updated_at = time.monotonic()
             self._error = None
+            self._position_error = position_error
 
 
 def normalize_angle(angle_rad: float) -> float:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from pathlib import Path
 import time
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -10,13 +12,12 @@ import numpy as np
 from collie_demo.controller import ApproachConfig, ApproachController
 from collie_demo.fruit import FruitDetection
 from collie_demo.heading import HeadingSample, normalize_angle
-from collie_demo.matcher import FruitInstanceMatcher
-from collie_demo.memory import AppearanceEncoder
 from collie_demo.mission import MissionConfig
 from collie_demo.motion import UnitreeMotionAdapter
 from collie_demo.runtime import (
     ARM_CONFIRMATION,
     DEMO_CONFIRMATION,
+    DEMO_GO_CONFIRMATION,
     NAVIGATION_ARM_CONFIRMATION,
     CollieRuntime,
     RuntimeCommandError,
@@ -124,6 +125,23 @@ class JetsonSpeedProduceDetector(FakeProduceDetector):
         return super().detect(image)
 
 
+class FastMovingProduceDetector(FakeProduceDetector):
+    def __init__(self) -> None:
+        self.x = 300
+
+    def detect(self, _image: object) -> list[FruitDetection]:
+        self.x = min(900, self.x + 80)
+        return [
+            FruitDetection(
+                class_id=6,
+                label="banana",
+                confidence=0.88,
+                bbox_xyxy=(self.x, 200, self.x + 50, 280),
+                center=(self.x + 25, 240),
+            )
+        ]
+
+
 class FakeProduceTracker:
     def __init__(self, bbox: tuple[int, int, int, int]) -> None:
         self.bbox = bbox
@@ -205,6 +223,57 @@ class MotionCoupledHeading:
         return HeadingSample(self.yaw, 0.0, True)
 
 
+class MotionCoupledPose(MotionCoupledHeading):
+    def __init__(self, avoidance: FakeAvoidance, sport: FakeSport | None = None) -> None:
+        super().__init__(avoidance, sport)
+        self.x_m = 0.0
+        self.y_m = 0.0
+        self.last_update_at = time.monotonic()
+        self.simulation_speed = 10.0
+
+    def status(self) -> HeadingSample:
+        now = time.monotonic()
+        elapsed_s = min(0.1, now - self.last_update_at) * self.simulation_speed
+        self.last_update_at = now
+        yaw_rate = 0.0
+        if self.sport is not None:
+            yaw_rate = self.sport.current_move[2]
+        if not yaw_rate and self.avoidance.moves:
+            yaw_rate = self.avoidance.moves[-1][2]
+        self.yaw = normalize_angle(self.yaw + yaw_rate * elapsed_s)
+        forward_mps = self.avoidance.moves[-1][0] if self.avoidance.moves else 0.0
+        if forward_mps:
+            self.x_m += forward_mps * math.cos(self.yaw) * elapsed_s
+            self.y_m += forward_mps * math.sin(self.yaw) * elapsed_s
+        return HeadingSample(
+            self.yaw,
+            0.0,
+            True,
+            None,
+            self.x_m,
+            self.y_m,
+            True,
+            None,
+        )
+
+
+class CallbackStretchSport(FakeSport):
+    def __init__(self, on_stretch: Callable[[], None]) -> None:
+        super().__init__()
+        self.on_stretch = on_stretch
+
+    def Stretch(self) -> int:
+        result = super().Stretch()
+        self.on_stretch()
+        return result
+
+
+class FailingStretchSport(FakeSport):
+    def Stretch(self) -> int:
+        self.stretch_calls += 1
+        return 3104
+
+
 def test_runtime_requires_confirmation_then_pulses_forward() -> None:
     async def scenario() -> None:
         avoidance = FakeAvoidance()
@@ -235,12 +304,19 @@ def test_runtime_requires_confirmation_then_pulses_forward() -> None:
             else:
                 raise AssertionError("motion armed without a selected fruit")
             status = await runtime.status()
+            assert status["camera_fps"] is not None
+            assert status["frame_width"] == 1280
+            assert status["frame_height"] == 720
+            assert status["camera_stream"] == "sdk_jpeg_passthrough"
             assert status["produce"]["detections"][0]["label"] == "apple"
             assert status["produce"]["inference_ms"] is not None
             assert status["selected_target_name"] is None
 
             apple = await runtime.select_target("apple", (1010, 240))
             assert apple["selected_target_name"] == "apple"
+            assert apple["runtime_id"]
+            apple_lock_id = apple["target_lock_id"]
+            assert isinstance(apple_lock_id, int)
             assert apple["selected_target_kind"] == "produce"
             assert apple["selected_target_hint"] == (1010, 240)
             assert apple["armed"] is False
@@ -252,6 +328,7 @@ def test_runtime_requires_confirmation_then_pulses_forward() -> None:
 
             banana = await runtime.select_target("banana", (350, 240))
             assert banana["selected_target_name"] == "banana"
+            assert banana["target_lock_id"] == apple_lock_id + 1
             assert banana["armed"] is False
             await asyncio.sleep(0.18)
             await runtime.arm(ARM_CONFIRMATION)
@@ -342,7 +419,7 @@ def test_navigation_lease_expires_to_hardware_stop() -> None:
     asyncio.run(scenario())
 
 
-def test_sustained_yolo_loss_clears_selected_tracker() -> None:
+def test_sustained_yolo_loss_preserves_disarmed_choice_but_removes_readiness() -> None:
     async def scenario() -> None:
         detector = ToggleProduceDetector()
         runtime = CollieRuntime(
@@ -372,20 +449,42 @@ def test_sustained_yolo_loss_clears_selected_tracker() -> None:
 
             for _ in range(100):
                 status = await runtime.status()
-                if status["selected_target_name"] is None:
+                if (
+                    status["selected_target_name"] == "banana"
+                    and status["selected_target"] is None
+                ):
                     break
                 await asyncio.sleep(0.01)
             else:
-                raise AssertionError("missing banana remained selected")
+                raise AssertionError("missing banana did not become stale")
 
+            assert status["selected_target_name"] == "banana"
+            assert status["target_lock_id"] == 1
             assert status["selected_target"] is None
             assert status["produce"]["tracker"]["label"] is None
-            assert status["produce"]["tracker"]["revalidation_failures"] == 0
+            assert status["produce"]["tracker"]["revalidation_failures"] >= 3
             assert (
                 status["produce"]["tracker"]["revalidation_failures_required"]
                 == 3
             )
             assert status["command"]["reason"] == "selected_target_not_revalidated"
+            assert status["can_follow"] is False
+
+            detector.visible = True
+            for _ in range(100):
+                status = await runtime.status()
+                if (
+                    status["selected_target"] is not None
+                    and status["produce"]["tracker"]["revalidation_failures"] == 0
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("same selected banana was not reacquired")
+
+            assert status["selected_target_name"] == "banana"
+            assert status["target_lock_id"] == 1
+            assert status["produce"]["tracker"]["revalidation_failures"] == 0
         finally:
             await runtime.close()
 
@@ -738,7 +837,6 @@ def test_saved_fruit_memory_survives_visual_target_loss() -> None:
             maximum_produce_age_s=0.1,
             mission_config=MissionConfig(
                 enabled=True,
-                capture_samples=2,
                 capture_timeout_s=0.6,
             ),
         )
@@ -750,7 +848,7 @@ def test_saved_fruit_memory_survives_visual_target_loss() -> None:
                 await asyncio.sleep(0.01)
             saved = await runtime.remember_target("banana", (350, 240))
             assert saved["memory"]["label"] == "banana"
-            assert saved["memory"]["sample_count"] == 2
+            assert saved["memory"]["role"] == "target_class"
 
             detector.visible = False
             for _ in range(100):
@@ -768,7 +866,392 @@ def test_saved_fruit_memory_survives_visual_target_loss() -> None:
     asyncio.run(scenario())
 
 
+def test_saving_initial_fruit_runs_one_stock_hello_gesture() -> None:
+    async def scenario() -> None:
+        sport, avoidance = FakeSport(), FakeAvoidance()
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(),
+            motion=UnitreeMotionAdapter(sport, avoidance),
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            produce_detector=FakeProduceDetector(),
+            loop_hz=60.0,
+            maximum_produce_age_s=0.75,
+            mission_config=MissionConfig(
+                enabled=True,
+                initial_hello_enabled=True,
+                capture_timeout_s=0.6,
+            ),
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                if (await runtime.status())["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            saved = await runtime.remember_target("banana", (350, 240))
+
+            assert saved["memory"]["label"] == "banana"
+            assert saved["mission"]["initial_hello_status"] == "complete"
+            assert saved["mission"]["initial_hello_error"] is None
+            assert sport.hello_calls == 1
+            assert saved["armed"] is False
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_saving_initial_fruit_accepts_already_stopped_hello_boundary() -> None:
+    async def scenario() -> None:
+        sport, avoidance = FakeSport(), FakeAvoidance()
+        sport.stop_result = -1
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(),
+            motion=UnitreeMotionAdapter(sport, avoidance),
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            produce_detector=FakeProduceDetector(),
+            loop_hz=60.0,
+            maximum_produce_age_s=0.75,
+            mission_config=MissionConfig(
+                enabled=True,
+                initial_hello_enabled=True,
+                capture_timeout_s=0.6,
+            ),
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                if (await runtime.status())["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            saved = await runtime.remember_target("banana", (350, 240))
+
+            assert saved["mission"]["initial_hello_status"] == "complete"
+            assert saved["mission"]["can_start"] is False
+            assert saved["motion"]["fault"] is None
+            assert sport.hello_calls == 1
+        finally:
+            sport.stop_result = 0
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_start_over_invalidates_an_inflight_save_and_resets_the_whole_round() -> None:
+    class BlockingHelloMotion:
+        def __init__(self) -> None:
+            self.initialized = False
+            self.hello_started = asyncio.Event()
+            self.release_hello = asyncio.Event()
+
+        @property
+        def armed(self) -> bool:
+            return False
+
+        async def initialize(self) -> None:
+            self.initialized = True
+
+        async def perform_hello(self) -> None:
+            self.hello_started.set()
+            await self.release_hello.wait()
+
+        async def emergency_stop(self) -> list[str]:
+            if self.hello_started.is_set():
+                self.release_hello.set()
+            return []
+
+        async def close(self) -> list[str]:
+            self.release_hello.set()
+            return []
+
+        def status(self) -> dict[str, object]:
+            return {
+                "initialized": self.initialized,
+                "fault": None,
+                "limits": {
+                    "forward_mps": 0.0,
+                    "yaw_rps": 0.0,
+                    "lateral_mps": 0.0,
+                },
+                "last_command": {
+                    "forward_mps": 0.0,
+                    "yaw_rps": 0.0,
+                    "reason": "test",
+                },
+            }
+
+    async def scenario() -> None:
+        motion = BlockingHelloMotion()
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(),
+            motion=motion,  # type: ignore[arg-type]
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            produce_detector=FakeProduceDetector(),
+            loop_hz=60.0,
+            mission_config=MissionConfig(
+                enabled=True,
+                initial_hello_enabled=True,
+                capture_timeout_s=0.6,
+            ),
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                status = await runtime.status()
+                if status["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            old_round_id = status["round_id"]
+            save_task = asyncio.create_task(
+                runtime.remember_target(
+                    "banana",
+                    (350, 240),
+                    expected_round_id=old_round_id,
+                )
+            )
+            await asyncio.wait_for(motion.hello_started.wait(), timeout=1.0)
+
+            reset = await runtime.reset_round()
+
+            try:
+                await save_task
+            except RuntimeCommandError as exc:
+                assert "round was reset" in str(exc)
+            else:
+                raise AssertionError("an old save repopulated a reset round")
+            assert reset["round_id"] != old_round_id
+            assert reset["memory"] is None
+            assert reset["selected_target_name"] is None
+            assert reset["mission"]["phase"] == "idle"
+            assert reset["mission"]["reason"] == "round_reset"
+            assert reset["follow_active"] is False
+            assert reset["armed"] is False
+            assert reset["forward_elapsed_s"] == 0.0
+            assert reset["command"] == {
+                "forward_mps": 0.0,
+                "yaw_rps": 0.0,
+                "reason": "round_reset",
+            }
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_return_home_demo_refuses_to_start_without_fresh_local_position() -> None:
+    async def scenario() -> None:
+        sport, avoidance = FakeSport(), FakeAvoidance()
+        runtime = CollieRuntime(
+            camera=NearBananaCamera(),
+            controller=ApproachController(),
+            motion=UnitreeMotionAdapter(sport, avoidance),
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            produce_detector=NearBananaDetector(),
+            loop_hz=60.0,
+            heading_provider=MotionCoupledHeading(avoidance, sport),
+            mission_config=MissionConfig(
+                enabled=True,
+                autonomous_turn_enabled=True,
+                direct_turn_enabled=True,
+                return_home_enabled=True,
+                capture_timeout_s=0.6,
+            ),
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                if (await runtime.status())["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            await runtime.remember_target("banana", (640, 645))
+
+            try:
+                await runtime.start_demo(DEMO_CONFIRMATION)
+            except RuntimeCommandError as exc:
+                assert "local position" in str(exc)
+            else:
+                raise AssertionError("demo started without a fresh local position")
+
+            status = await runtime.status()
+            assert status["mission"]["can_start"] is False
+            assert "local position" in status["mission"]["readiness"]
+            assert status["armed"] is False
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
 def test_memory_demo_turns_searches_and_reuses_guarded_follow() -> None:
+    async def scenario() -> None:
+        sport, avoidance = FakeSport(), FakeAvoidance()
+        motion = UnitreeMotionAdapter(sport, avoidance)
+        camera = NearBananaCamera()
+        pose = MotionCoupledPose(avoidance, sport)
+        runtime = CollieRuntime(
+            camera=camera,
+            controller=ApproachController(
+                ApproachConfig(
+                    stable_frames_required=2,
+                    maximum_target_age_s=0.75,
+                    forward_mps=0.08,
+                    forward_budget_s=0.08,
+                )
+            ),
+            motion=motion,
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            produce_detector=NearBananaDetector(),
+            loop_hz=60.0,
+            maximum_produce_age_s=0.75,
+            follow_period_s=0.02,
+            heading_provider=pose,
+            mission_config=MissionConfig(
+                enabled=True,
+                autonomous_turn_enabled=True,
+                direct_turn_enabled=True,
+                match_stretch_enabled=True,
+                match_stretch_settle_s=0.0,
+                match_reacquire_timeout_s=1.0,
+                arrival_hello_enabled=True,
+                arrival_hello_settle_s=0.0,
+                return_home_enabled=True,
+                return_arrival_tolerance_m=0.02,
+                return_heading_tolerance_rad=0.10,
+                return_heading_gate_rad=0.55,
+                return_forward_mps=0.08,
+                return_yaw_gain=1.2,
+                return_timeout_s=3.0,
+                return_stall_timeout_s=0.75,
+                return_stall_min_progress_m=0.005,
+                capture_timeout_s=0.6,
+                match_confirmations_required=2,
+                approach_misses_allowed=2,
+                turn_angle_rad=0.65,
+                turn_rate_rps=0.20,
+                turn_tolerance_rad=0.05,
+                turn_timeout_s=1.5,
+                search_rate_rps=0.10,
+                search_sweep_rad=2.5,
+                search_timeout_s=1.5,
+            ),
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                if (await runtime.status())["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            await runtime.remember_target("banana", (640, 645))
+            started = await runtime.start_demo(DEMO_CONFIRMATION)
+            assert started["mission"]["active"] is True
+            assert started["mission"]["direct_turn_enabled"] is True
+
+            for _ in range(300):
+                status = await runtime.status()
+                if status["mission"]["phase"] in {"waiting_for_go", "aborted"}:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("memory demo did not wait for Go")
+
+            assert status["mission"]["phase"] == "waiting_for_go", repr(
+                (status["mission"], status["last_error"])
+            )
+            assert status["mission"]["can_go"] is True
+            assert not any(move[0] > 0.0 for move in avoidance.moves)
+            assert status["armed"] is False
+            assert status["command"]["forward_mps"] == 0.0
+
+            released = await runtime.approve_demo_go(DEMO_GO_CONFIRMATION)
+            assert released["mission"]["phase"] == "confirming"
+            assert released["mission"]["can_go"] is False
+
+            for _ in range(300):
+                status = await runtime.status()
+                if status["mission"]["phase"] in {"success", "aborted"}:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("memory demo did not finish after Go")
+
+            assert status["mission"]["phase"] == "success", repr(
+                (status["mission"], status["last_error"])
+            )
+            assert status["mission"]["match_stretch_status"] == "complete"
+            assert status["mission"]["match_stretch_error"] is None
+            assert status["mission"]["arrival_hello_status"] == "complete"
+            assert status["mission"]["arrival_hello_error"] is None
+            assert status["mission"]["near_target_seen"] is True
+            assert status["mission"]["return_home_status"] == "complete"
+            assert status["mission"]["return_distance_m"] <= 0.02
+            assert status["mission"]["home_pose"] == {
+                "x_m": 0.0,
+                "y_m": 0.0,
+                "yaw_rad": 0.0,
+            }
+            assert status["memory"]["label"] == "banana"
+            assert status["armed"] is False
+            assert status["command"]["forward_mps"] == 0.0
+            assert any(move[2] > 0.0 for move in sport.moves)
+            assert sport.stretch_calls == 1
+            assert sport.hello_calls == 1
+            assert all(move[0] == 0.0 and move[1] == 0.0 for move in sport.moves)
+            assert all(move[2] != 0.20 for move in avoidance.moves)
+            assert any(move[0] > 0.0 for move in avoidance.moves)
+            assert any(abs(move[2]) > 0.0 for move in avoidance.moves)
+            assert avoidance.moves[-1] == (0.0, 0.0, 0.0)
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_measured_turn_uses_avoidance_motion_when_direct_turn_is_disabled() -> None:
+    async def scenario() -> None:
+        sport, avoidance = FakeSport(), FakeAvoidance()
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(),
+            motion=UnitreeMotionAdapter(sport, avoidance),
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            produce_detector=FakeProduceDetector(),
+            loop_hz=60.0,
+            maximum_produce_age_s=0.75,
+            heading_provider=MotionCoupledHeading(avoidance, sport),
+            mission_config=MissionConfig(
+                enabled=True,
+                autonomous_turn_enabled=True,
+                direct_turn_enabled=False,
+                turn_angle_rad=0.35,
+                turn_rate_rps=0.20,
+                turn_tolerance_rad=0.05,
+                turn_timeout_s=1.0,
+            ),
+        )
+        await runtime.start()
+        try:
+            await runtime._run_measured_turn()
+
+            assert any(move == (0.0, 0.0, 0.20) for move in avoidance.moves)
+            assert sport.moves == []
+            assert avoidance.moves[-1] == (0.0, 0.0, 0.0)
+            assert runtime._mission.turn_progress_rad >= 0.30
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_memory_demo_accepts_a_different_banana_of_the_saved_class() -> None:
     async def scenario() -> None:
         sport, avoidance = FakeSport(), FakeAvoidance()
         motion = UnitreeMotionAdapter(sport, avoidance)
@@ -790,96 +1273,11 @@ def test_memory_demo_turns_searches_and_reuses_guarded_follow() -> None:
             loop_hz=60.0,
             maximum_produce_age_s=0.75,
             follow_period_s=0.02,
-            instance_matcher=FruitInstanceMatcher(
-                AppearanceEncoder(minimum_crop_side_px=8),
-                minimum_score=0.70,
-                minimum_margin=0.04,
-            ),
             heading_provider=MotionCoupledHeading(avoidance, sport),
             mission_config=MissionConfig(
                 enabled=True,
                 autonomous_turn_enabled=True,
                 direct_turn_enabled=True,
-                capture_samples=2,
-                capture_timeout_s=0.6,
-                match_confirmations_required=2,
-                approach_misses_allowed=2,
-                turn_angle_rad=0.65,
-                turn_rate_rps=0.20,
-                turn_tolerance_rad=0.05,
-                turn_timeout_s=1.5,
-                search_rate_rps=0.10,
-                search_sweep_rad=2.5,
-                search_timeout_s=1.5,
-            ),
-        )
-        await runtime.start()
-        try:
-            for _ in range(100):
-                if (await runtime.status())["produce"]["detections"]:
-                    break
-                await asyncio.sleep(0.01)
-            await runtime.remember_target("banana", (640, 645))
-            camera.show_different_banana = True
-            started = await runtime.start_demo(DEMO_CONFIRMATION)
-            assert started["mission"]["active"] is True
-            assert started["mission"]["direct_turn_enabled"] is True
-
-            for _ in range(300):
-                status = await runtime.status()
-                if status["mission"]["phase"] in {"success", "aborted"}:
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                raise AssertionError("memory demo did not reach a terminal state")
-
-            assert status["mission"]["phase"] == "success", status["mission"]
-            assert status["mission"]["near_target_seen"] is True
-            assert status["memory"]["label"] == "banana"
-            assert status["armed"] is False
-            assert status["command"]["forward_mps"] == 0.0
-            assert any(move[2] > 0.0 for move in sport.moves)
-            assert all(move[0] == 0.0 and move[1] == 0.0 for move in sport.moves)
-            assert all(move[2] != 0.20 for move in avoidance.moves)
-            assert any(move[0] > 0.0 for move in avoidance.moves)
-            assert avoidance.moves[-1] == (0.0, 0.0, 0.0)
-        finally:
-            await runtime.close()
-
-    asyncio.run(scenario())
-
-
-def test_memory_demo_never_approaches_the_saved_banana() -> None:
-    async def scenario() -> None:
-        sport, avoidance = FakeSport(), FakeAvoidance()
-        motion = UnitreeMotionAdapter(sport, avoidance)
-        runtime = CollieRuntime(
-            camera=NearBananaCamera(),
-            controller=ApproachController(
-                ApproachConfig(
-                    stable_frames_required=2,
-                    maximum_target_age_s=0.75,
-                    forward_mps=0.08,
-                    forward_budget_s=0.08,
-                )
-            ),
-            motion=motion,
-            motion_enabled=True,
-            allow_unranged_forward=True,
-            produce_detector=NearBananaDetector(),
-            loop_hz=60.0,
-            maximum_produce_age_s=0.75,
-            follow_period_s=0.02,
-            instance_matcher=FruitInstanceMatcher(
-                AppearanceEncoder(minimum_crop_side_px=8),
-                maximum_saved_similarity=0.94,
-            ),
-            heading_provider=MotionCoupledHeading(avoidance, sport),
-            mission_config=MissionConfig(
-                enabled=True,
-                autonomous_turn_enabled=True,
-                direct_turn_enabled=True,
-                capture_samples=2,
                 capture_timeout_s=0.6,
                 match_confirmations_required=2,
                 approach_misses_allowed=2,
@@ -899,22 +1297,221 @@ def test_memory_demo_never_approaches_the_saved_banana() -> None:
                     break
                 await asyncio.sleep(0.01)
             await runtime.remember_target("banana", (640, 645))
+            camera.show_different_banana = True
             await runtime.start_demo(DEMO_CONFIRMATION)
 
             for _ in range(200):
                 status = await runtime.status()
-                if status["mission"]["phase"] in {"success", "aborted"}:
+                if status["mission"]["phase"] in {"waiting_for_go", "aborted"}:
                     break
                 await asyncio.sleep(0.01)
             else:
-                raise AssertionError("saved-only mission did not stop")
+                raise AssertionError("class-based mission did not lock")
 
-            assert status["mission"]["phase"] == "aborted"
-            assert "different fruit" in status["mission"]["reason"]
-            assert status["mission"]["target_policy"] == "different_instance"
-            assert status["mission"]["last_match"]["reason"] == "saved_instance_only"
+            assert status["mission"]["phase"] == "waiting_for_go"
+            assert status["mission"]["target_policy"] == "same_class"
+            assert (
+                status["mission"]["last_match"]["reason"]
+                == "target_class_detected"
+            )
             assert not any(move[0] > 0.0 for move in avoidance.moves)
             assert status["armed"] is False
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_memory_demo_reacquires_same_class_after_stretch() -> None:
+    async def scenario() -> None:
+        camera = NearBananaCamera()
+        avoidance = FakeAvoidance()
+        sport = CallbackStretchSport(
+            lambda: setattr(camera, "show_different_banana", True)
+        )
+        runtime = CollieRuntime(
+            camera=camera,
+            controller=ApproachController(
+                ApproachConfig(
+                    stable_frames_required=2,
+                    maximum_target_age_s=0.75,
+                    forward_mps=0.08,
+                    forward_budget_s=0.08,
+                )
+            ),
+            motion=UnitreeMotionAdapter(sport, avoidance),
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            produce_detector=NearBananaDetector(),
+            loop_hz=60.0,
+            maximum_produce_age_s=0.75,
+            follow_period_s=0.02,
+            heading_provider=MotionCoupledHeading(avoidance, sport),
+            mission_config=MissionConfig(
+                enabled=True,
+                autonomous_turn_enabled=True,
+                direct_turn_enabled=True,
+                match_stretch_enabled=True,
+                match_stretch_settle_s=0.0,
+                match_reacquire_timeout_s=0.4,
+                capture_timeout_s=0.6,
+                match_confirmations_required=2,
+                approach_misses_allowed=2,
+                turn_angle_rad=0.65,
+                turn_rate_rps=0.20,
+                turn_tolerance_rad=0.05,
+                turn_timeout_s=1.5,
+                search_rate_rps=0.10,
+                search_sweep_rad=2.5,
+                search_timeout_s=1.5,
+            ),
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                if (await runtime.status())["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            await runtime.remember_target("banana", (640, 645))
+            await runtime.start_demo(DEMO_CONFIRMATION)
+
+            for _ in range(300):
+                status = await runtime.status()
+                if status["mission"]["phase"] in {"waiting_for_go", "aborted"}:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("post-stretch class reacquisition did not finish")
+
+            assert status["mission"]["phase"] == "waiting_for_go"
+            assert status["mission"]["target_policy"] == "same_class"
+            assert status["mission"]["last_match"]["reason"] == "target_class_detected"
+            assert status["mission"]["match_stretch_status"] == "complete"
+            assert sport.stretch_calls == 1
+            assert not any(move[0] > 0.0 for move in avoidance.moves)
+            assert status["armed"] is False
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_memory_demo_keeps_optional_stretch_failure_nonfatal() -> None:
+    async def scenario() -> None:
+        camera = NearBananaCamera()
+        avoidance = FakeAvoidance()
+        sport = FailingStretchSport()
+        runtime = CollieRuntime(
+            camera=camera,
+            controller=ApproachController(
+                ApproachConfig(
+                    stable_frames_required=2,
+                    maximum_target_age_s=0.75,
+                )
+            ),
+            motion=UnitreeMotionAdapter(sport, avoidance),
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            produce_detector=NearBananaDetector(),
+            loop_hz=60.0,
+            maximum_produce_age_s=0.75,
+            follow_period_s=0.02,
+            heading_provider=MotionCoupledHeading(avoidance, sport),
+            mission_config=MissionConfig(
+                enabled=True,
+                autonomous_turn_enabled=True,
+                direct_turn_enabled=True,
+                match_stretch_enabled=True,
+                match_stretch_settle_s=0.0,
+                match_reacquire_timeout_s=0.5,
+                capture_timeout_s=0.6,
+                match_confirmations_required=2,
+                turn_angle_rad=0.35,
+                turn_rate_rps=0.20,
+                turn_tolerance_rad=0.05,
+                turn_timeout_s=1.0,
+                search_rate_rps=0.10,
+                search_sweep_rad=1.0,
+                search_timeout_s=1.0,
+            ),
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                if (await runtime.status())["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            await runtime.remember_target("banana", (640, 645))
+            await runtime.start_demo(DEMO_CONFIRMATION)
+
+            for _ in range(300):
+                status = await runtime.status()
+                if status["mission"]["phase"] in {"waiting_for_go", "aborted"}:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("mission did not recover from Stretch failure")
+
+            assert status["mission"]["phase"] == "waiting_for_go", repr(
+                status["mission"]
+            )
+            assert status["mission"]["match_stretch_status"] == "failed"
+            assert "3104" in status["mission"]["match_stretch_error"]
+            assert status["mission"]["can_go"] is True
+            assert status["armed"] is False
+            assert not any(move[0] > 0.0 for move in avoidance.moves)
+            assert sport.stretch_calls == 1
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_search_sweep_accumulates_past_heading_wrap() -> None:
+    async def scenario() -> None:
+        detector = ToggleProduceDetector()
+        avoidance = FakeAvoidance()
+        sport = FakeSport()
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(),
+            motion=UnitreeMotionAdapter(sport, avoidance),
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            produce_detector=detector,
+            loop_hz=60.0,
+            maximum_produce_age_s=0.75,
+            heading_provider=MotionCoupledHeading(avoidance, sport),
+            mission_config=MissionConfig(
+                enabled=True,
+                autonomous_turn_enabled=True,
+                direct_turn_enabled=False,
+                capture_timeout_s=0.6,
+                search_rate_rps=0.20,
+                search_sweep_rad=4.5,
+                search_timeout_s=1.5,
+            ),
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                if (await runtime.status())["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            await runtime.remember_target("banana", (350, 240))
+            detector.visible = False
+
+            try:
+                await runtime._search_for_memory()
+            except RuntimeCommandError as exc:
+                assert str(exc) == "saved fruit class not found in search sweep"
+            else:
+                raise AssertionError("bounded sweep did not stop after crossing wrap")
+
+            status = await runtime.status()
+            assert status["mission"]["search_progress_deg"] >= math.degrees(4.5)
+            assert status["armed"] is True
+            await runtime.stop("test_complete")
         finally:
             await runtime.close()
 
@@ -962,6 +1559,39 @@ def test_detector_only_tracking_stays_fresh_at_jetson_cadence() -> None:
             assert max(item["selected_target_age_s"] for item in statuses) < 0.35
             assert all(item["follow_readiness"] == "ready" for item in statuses)
             assert all(item["can_follow"] is True for item in statuses)
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_detector_only_tracking_accepts_fast_same_class_motion() -> None:
+    async def scenario() -> None:
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(ApproachConfig(stable_frames_required=1)),
+            motion=None,
+            motion_enabled=False,
+            allow_unranged_forward=True,
+            produce_detector=FastMovingProduceDetector(),
+            loop_hz=30.0,
+            maximum_produce_age_s=0.2,
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                status = await runtime.status()
+                if status["produce"]["detections"]:
+                    break
+                await asyncio.sleep(0.01)
+            await runtime.select_target("banana", (380, 240))
+            await asyncio.sleep(0.45)
+            status = await runtime.status()
+
+            assert status["selected_target_name"] == "banana"
+            assert status["selected_target"] is not None
+            assert status["produce"]["tracker"]["revalidation_failures"] == 0
+            assert status["follow_readiness"] == "ready"
         finally:
             await runtime.close()
 

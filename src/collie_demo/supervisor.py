@@ -29,6 +29,24 @@ def process_probe_ok(status_code: int, payload: object) -> bool:
     )
 
 
+def process_failure_is_fatal(
+    *,
+    failures: int,
+    failure_limit: int,
+    elapsed_s: float,
+    startup_grace_s: float,
+) -> bool:
+    """Delay unreachable-process enforcement during CUDA/model warm-up.
+
+    The child can serve camera health before its first CUDA inference. That
+    cold inference can temporarily occupy the process for several seconds on
+    a Jetson. Motion is still disarmed during this grace period, and a child
+    that actually exits is handled immediately by the parent loop.
+    """
+
+    return elapsed_s >= startup_grace_s and failures >= failure_limit
+
+
 def emergency_brake() -> None:
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
     from unitree_sdk2py.go2.sport.sport_client import SportClient
@@ -61,8 +79,13 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
-    deadline = time.monotonic() + 35.0
-    failure_limit = int(os.environ.get("COLLIE_SUPERVISOR_FAILURE_LIMIT", "12"))
+    started_at = time.monotonic()
+    deadline = started_at + 75.0
+    startup_grace_s = max(
+        0.0,
+        float(os.environ.get("COLLIE_SUPERVISOR_STARTUP_GRACE_S", "60")),
+    )
+    failure_limit = int(os.environ.get("COLLIE_SUPERVISOR_FAILURE_LIMIT", "80"))
     healthy_once = False
     failures = 0
     while child.poll() is None and not terminating:
@@ -79,7 +102,19 @@ def main() -> None:
             failures += 1
         elif time.monotonic() >= deadline:
             failures = failure_limit
-        if failures >= failure_limit:
+        if process_failure_is_fatal(
+            failures=failures,
+            failure_limit=failure_limit,
+            elapsed_s=time.monotonic() - started_at,
+            startup_grace_s=startup_grace_s,
+        ):
+            print(
+                "collie supervisor: child API unreachable beyond tolerance "
+                f"(failures={failures}, limit={failure_limit}, "
+                f"elapsed_s={time.monotonic() - started_at:.1f})",
+                file=sys.stderr,
+                flush=True,
+            )
             try:
                 emergency_brake()
             finally:

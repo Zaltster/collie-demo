@@ -13,8 +13,12 @@ class MissionPhase(str, Enum):
     MEMORIZED = "memorized"
     TURNING = "turning"
     SEARCHING = "searching"
+    ACKNOWLEDGING = "acknowledging"
+    WAITING_FOR_GO = "waiting_for_go"
     CONFIRMING = "confirming"
     APPROACHING = "approaching"
+    CELEBRATING = "celebrating"
+    RETURNING_HOME = "returning_home"
     SUCCESS = "success"
     ABORTED = "aborted"
 
@@ -24,7 +28,21 @@ class MissionConfig:
     enabled: bool = False
     autonomous_turn_enabled: bool = False
     direct_turn_enabled: bool = False
-    capture_samples: int = 5
+    initial_hello_enabled: bool = False
+    match_stretch_enabled: bool = False
+    match_stretch_settle_s: float = 3.5
+    match_reacquire_timeout_s: float = 3.0
+    arrival_hello_enabled: bool = False
+    arrival_hello_settle_s: float = 0.35
+    return_home_enabled: bool = False
+    return_arrival_tolerance_m: float = 0.25
+    return_heading_tolerance_rad: float = math.radians(10.0)
+    return_heading_gate_rad: float = math.radians(30.0)
+    return_forward_mps: float = 0.20
+    return_yaw_gain: float = 1.2
+    return_timeout_s: float = 20.0
+    return_stall_timeout_s: float = 3.0
+    return_stall_min_progress_m: float = 0.06
     capture_timeout_s: float = 2.0
     match_confirmations_required: int = 3
     approach_misses_allowed: int = 2
@@ -41,8 +59,6 @@ class MissionConfig:
     near_center_ratio: float = 0.72
 
     def __post_init__(self) -> None:
-        if self.capture_samples < 2:
-            raise ValueError("capture_samples must be at least two")
         if self.capture_timeout_s <= 0.0:
             raise ValueError("capture_timeout_s must be positive")
         if self.match_confirmations_required < 1:
@@ -59,9 +75,29 @@ class MissionConfig:
             "search_rate_rps",
             "search_sweep_rad",
             "search_timeout_s",
+            "match_reacquire_timeout_s",
+            "return_arrival_tolerance_m",
+            "return_heading_tolerance_rad",
+            "return_heading_gate_rad",
+            "return_forward_mps",
+            "return_yaw_gain",
+            "return_timeout_s",
+            "return_stall_timeout_s",
+            "return_stall_min_progress_m",
         ):
-            if getattr(self, name) <= 0.0:
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be positive")
+        if (
+            not math.isfinite(self.match_stretch_settle_s)
+            or self.match_stretch_settle_s < 0.0
+        ):
+            raise ValueError("match_stretch_settle_s must be non-negative")
+        if (
+            not math.isfinite(self.arrival_hello_settle_s)
+            or self.arrival_hello_settle_s < 0.0
+        ):
+            raise ValueError("arrival_hello_settle_s must be non-negative")
 
 
 @dataclass(slots=True)
@@ -74,6 +110,18 @@ class MissionTelemetry:
     match_failures: int = 0
     last_match: dict[str, object] | None = None
     near_target_seen: bool = False
+    initial_hello_status: str = "not_requested"
+    initial_hello_error: str | None = None
+    match_stretch_status: str = "not_requested"
+    match_stretch_error: str | None = None
+    arrival_hello_status: str = "not_requested"
+    arrival_hello_error: str | None = None
+    search_progress_rad: float = 0.0
+    home_pose: dict[str, float] | None = None
+    return_home_status: str = "not_requested"
+    return_distance_m: float | None = None
+    return_heading_error_rad: float | None = None
+    return_progress_m: float = 0.0
 
     def to_dict(self, now: float) -> dict[str, object]:
         return {
@@ -87,4 +135,20 @@ class MissionTelemetry:
             "match_failures": self.match_failures,
             "last_match": self.last_match,
             "near_target_seen": self.near_target_seen,
+            "initial_hello_status": self.initial_hello_status,
+            "initial_hello_error": self.initial_hello_error,
+            "match_stretch_status": self.match_stretch_status,
+            "match_stretch_error": self.match_stretch_error,
+            "arrival_hello_status": self.arrival_hello_status,
+            "arrival_hello_error": self.arrival_hello_error,
+            "search_progress_deg": round(math.degrees(self.search_progress_rad), 1),
+            "home_pose": self.home_pose,
+            "return_home_status": self.return_home_status,
+            "return_distance_m": None
+            if self.return_distance_m is None
+            else round(self.return_distance_m, 3),
+            "return_heading_error_deg": None
+            if self.return_heading_error_rad is None
+            else round(math.degrees(self.return_heading_error_rad), 1),
+            "return_progress_m": round(self.return_progress_m, 3),
         }

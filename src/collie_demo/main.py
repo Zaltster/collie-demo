@@ -11,8 +11,6 @@ from .camera import create_camera
 from .controller import ApproachConfig, ApproachController
 from .fruit import FruitDetector
 from .heading import SportModeHeadingProvider
-from .matcher import FruitInstanceMatcher
-from .memory import AppearanceEncoder
 from .mission import MissionConfig
 from .motion import MotionConfig, create_motion, initialize_dds
 from .runtime import CollieRuntime
@@ -54,7 +52,43 @@ def build_runtime() -> CollieRuntime:
         enabled=env_bool("COLLIE_MEMORY_DEMO_ENABLED"),
         autonomous_turn_enabled=env_bool("COLLIE_AUTONOMOUS_TURN_ENABLED"),
         direct_turn_enabled=env_bool("COLLIE_DIRECT_TURN_ENABLED"),
-        capture_samples=int(os.environ.get("COLLIE_MEMORY_SAMPLES", "5")),
+        initial_hello_enabled=env_bool("COLLIE_INITIAL_HELLO_ENABLED"),
+        match_stretch_enabled=env_bool("COLLIE_MATCH_STRETCH_ENABLED"),
+        match_stretch_settle_s=float(
+            os.environ.get("COLLIE_MATCH_STRETCH_SETTLE_S", "3.5")
+        ),
+        match_reacquire_timeout_s=float(
+            os.environ.get("COLLIE_MATCH_REACQUIRE_TIMEOUT_S", "3.0")
+        ),
+        arrival_hello_enabled=env_bool("COLLIE_ARRIVAL_HELLO_ENABLED"),
+        arrival_hello_settle_s=float(
+            os.environ.get("COLLIE_ARRIVAL_HELLO_SETTLE_S", "0.35")
+        ),
+        return_home_enabled=env_bool("COLLIE_RETURN_HOME_ENABLED"),
+        return_arrival_tolerance_m=float(
+            os.environ.get("COLLIE_RETURN_ARRIVAL_TOLERANCE_M", "0.25")
+        ),
+        return_heading_tolerance_rad=math.radians(
+            float(os.environ.get("COLLIE_RETURN_HEADING_TOLERANCE_DEG", "10"))
+        ),
+        return_heading_gate_rad=math.radians(
+            float(os.environ.get("COLLIE_RETURN_HEADING_GATE_DEG", "30"))
+        ),
+        return_forward_mps=float(
+            os.environ.get("COLLIE_RETURN_FORWARD_MPS", "0.20")
+        ),
+        return_yaw_gain=float(
+            os.environ.get("COLLIE_RETURN_YAW_GAIN", "1.2")
+        ),
+        return_timeout_s=float(
+            os.environ.get("COLLIE_RETURN_TIMEOUT_S", "20")
+        ),
+        return_stall_timeout_s=float(
+            os.environ.get("COLLIE_RETURN_STALL_TIMEOUT_S", "3.0")
+        ),
+        return_stall_min_progress_m=float(
+            os.environ.get("COLLIE_RETURN_STALL_MIN_PROGRESS_M", "0.06")
+        ),
         capture_timeout_s=float(
             os.environ.get("COLLIE_MEMORY_CAPTURE_TIMEOUT_S", "2.0")
         ),
@@ -103,11 +137,25 @@ def build_runtime() -> CollieRuntime:
     motion = (
         create_motion(
             MotionConfig(
-                maximum_forward_mps=controller_config.forward_mps,
+                maximum_forward_mps=max(
+                    controller_config.forward_mps,
+                    mission_config.return_forward_mps,
+                ),
                 maximum_yaw_rps=max(
                     controller_config.maximum_yaw_rps,
                     mission_config.turn_rate_rps,
                     mission_config.search_rate_rps,
+                    mission_config.return_yaw_gain
+                    * mission_config.return_heading_gate_rad,
+                ),
+                remote_api_settle_s=float(
+                    os.environ.get("COLLIE_REMOTE_API_SETTLE_S", "0.5")
+                ),
+                skill_timeout_s=float(
+                    os.environ.get("COLLIE_SKILL_TIMEOUT_S", "12.0")
+                ),
+                client_timeout_s=float(
+                    os.environ.get("COLLIE_CLIENT_TIMEOUT_S", "12.0")
                 ),
             )
         )
@@ -127,7 +175,10 @@ def build_runtime() -> CollieRuntime:
                 "COLLIE_PRODUCE_CLASS_THRESHOLDS"
             ),
             device=os.environ.get("COLLIE_INFERENCE_DEVICE", "").strip() or None,
+            task=os.environ.get("COLLIE_PRODUCE_TASK", "").strip() or None,
         ),
+        loop_hz=float(os.environ.get("COLLIE_CAMERA_HZ", "30")),
+        annotated_hz=float(os.environ.get("COLLIE_ANNOTATED_HZ", "5")),
         produce_revalidation_misses_required=int(
             os.environ.get("COLLIE_REVALIDATION_MISSES", "3")
         ),
@@ -137,22 +188,6 @@ def build_runtime() -> CollieRuntime:
         follow_period_s=float(os.environ.get("COLLIE_FOLLOW_PERIOD_S", "0.05")),
         follow_start_timeout_s=float(
             os.environ.get("COLLIE_FOLLOW_START_TIMEOUT_S", "1.5")
-        ),
-        instance_matcher=FruitInstanceMatcher(
-            AppearanceEncoder(
-                minimum_crop_side_px=int(
-                    os.environ.get("COLLIE_MIN_MEMORY_CROP_PX", "20")
-                )
-            ),
-            minimum_score=float(
-                os.environ.get("COLLIE_INSTANCE_MATCH_SCORE", "0.76")
-            ),
-            minimum_margin=float(
-                os.environ.get("COLLIE_INSTANCE_MATCH_MARGIN", "0.06")
-            ),
-            maximum_saved_similarity=float(
-                os.environ.get("COLLIE_SAVED_INSTANCE_REJECTION_SCORE", "0.94")
-            ),
         ),
         heading_provider=(
             SportModeHeadingProvider(

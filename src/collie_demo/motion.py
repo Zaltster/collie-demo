@@ -35,6 +35,8 @@ class SportClientProtocol(Protocol):
     def SetTimeout(self, timeout_s: float) -> Any: ...
     def Init(self) -> Any: ...
     def BalanceStand(self) -> int: ...
+    def Hello(self) -> int: ...
+    def Stretch(self) -> int: ...
     def Move(self, vx: float, vy: float, vyaw: float) -> int: ...
     def StopMove(self) -> int: ...
 
@@ -54,8 +56,14 @@ class MotionConfig:
     maximum_yaw_rps: float = 0.25
     command_watchdog_s: float = 0.35
     rpc_timeout_s: float = 0.75
-    client_timeout_s: float = 3.0
+    # Unitree's visible stock skills can take several seconds before their RPC
+    # returns. Keep both the SDK-side and our asyncio-side timeouts above the
+    # longest stage gesture so a completed animation is not reported as a
+    # transport failure.
+    skill_timeout_s: float = 12.0
+    client_timeout_s: float = 12.0
     avoidance_verify_interval_s: float = 0.30
+    remote_api_settle_s: float = 0.0
 
 
 class UnitreeMotionAdapter:
@@ -136,6 +144,8 @@ class UnitreeMotionAdapter:
                 self._last_verify_at = time.monotonic()
                 await self._success(self.avoidance.UseRemoteCommandFromApi, True)
                 self._remote_api_enabled = True
+                if self.config.remote_api_settle_s:
+                    await asyncio.sleep(self.config.remote_api_settle_s)
                 await self._success(self.avoidance.Move, 0.0, 0.0, 0.0)
             except Exception as exc:
                 await self._release_locked(use_stop=True)
@@ -157,11 +167,12 @@ class UnitreeMotionAdapter:
                 # the motion channel before handing yaw control to SportClient.
                 await self._success(self.avoidance.UseRemoteCommandFromApi, False)
                 await self._success(self.avoidance.SwitchSet, False)
-                await self._success(self.sport.StopMove)
-                # StopMove clears velocity but does not guarantee that the
-                # high-level gait will accept the next Move. Explicitly enter
-                # locomotion-ready BalanceStand before direct yaw.
-                await self._success(self.sport.BalanceStand)
+                await self._idle_stop()
+                # Unitree's Go2 high-level example issues Move directly;
+                # BalanceStand is a separate posture action, not a prerequisite
+                # for velocity control. Calling it here can be rejected with
+                # -1 when Woof is already standing, which must not prevent the
+                # guarded yaw command from being attempted.
             except Exception as exc:
                 await self._release_locked(use_stop=True)
                 raise MotionNotReady(f"direct yaw arm failed: {exc}") from exc
@@ -172,6 +183,66 @@ class UnitreeMotionAdapter:
             self._mode = "direct_yaw"
             self._last_command = VelocityCommand(reason="direct_yaw_armed_zero")
             return self._lease
+
+    async def perform_hello(self) -> None:
+        """Run the stock paw-forward gesture while locomotion is disarmed."""
+
+        async with self._lock:
+            self._require_ready()
+            if self._lease is not None:
+                raise MotionNotReady("motion lease already active")
+            self._cancel_watchdog()
+            try:
+                # Explicitly remove both locomotion owners before invoking a
+                # high-level SportClient skill. The lock prevents a turn or
+                # approach lease from being acquired until Hello returns.
+                await self._success(self.avoidance.UseRemoteCommandFromApi, False)
+                await self._success(self.avoidance.SwitchSet, False)
+                await self._idle_stop()
+                await self._success(
+                    self.sport.Hello,
+                    timeout_s=self.config.skill_timeout_s,
+                )
+            except Exception as exc:
+                await self._release_locked(use_stop=True)
+                raise MotionNotReady(f"hello gesture failed: {exc}") from exc
+            self._avoidance_enabled = False
+            self._remote_api_enabled = False
+            self._last_verify_at = None
+            self._last_command = VelocityCommand(reason="hello_gesture_complete")
+
+    async def perform_stretch(self, *, settle_s: float = 0.0) -> None:
+        """Run the stock stretch once while locomotion remains disarmed."""
+
+        settle_s = float(settle_s)
+        if not math.isfinite(settle_s) or settle_s < 0.0:
+            raise ValueError("stretch settle time must be finite and non-negative")
+        async with self._lock:
+            self._require_ready()
+            if self._lease is not None:
+                raise MotionNotReady("motion lease already active")
+            self._cancel_watchdog()
+            try:
+                # A high-level skill and a locomotion owner must never share
+                # the sport channel. Keep the exclusive lock through the
+                # visible animation and recovery stand.
+                await self._success(self.avoidance.UseRemoteCommandFromApi, False)
+                await self._success(self.avoidance.SwitchSet, False)
+                await self._idle_stop()
+                await self._success(
+                    self.sport.Stretch,
+                    timeout_s=self.config.skill_timeout_s,
+                )
+                if settle_s:
+                    await asyncio.sleep(settle_s)
+                await self._idle_stop()
+            except Exception as exc:
+                await self._release_locked(use_stop=True)
+                raise MotionNotReady(f"stretch gesture failed: {exc}") from exc
+            self._avoidance_enabled = False
+            self._remote_api_enabled = False
+            self._last_verify_at = None
+            self._last_command = VelocityCommand(reason="stretch_gesture_complete")
 
     async def send(self, lease: str, command: VelocityCommand) -> VelocityCommand:
         forward = self._bounded_forward(command.forward_mps)
@@ -227,10 +298,22 @@ class UnitreeMotionAdapter:
     async def emergency_stop(self) -> list[str]:
         self._cancel_watchdog()
         errors: list[str] = []
+        was_active = bool(
+            self._lease is not None
+            or self._mode is not None
+            or self._last_command.forward_mps != 0.0
+            or self._last_command.yaw_rps != 0.0
+        )
         if self._initialized:
             try:
                 result = await self._call_stop(self.sport.StopMove)
-                if result != 0:
+                # Go2 SportClient returns -1 when StopMove is repeated while
+                # the robot is already idle. Start Over must be idempotent in
+                # that state, but the same response while we own an active
+                # lease remains a hard fault because motion may not have
+                # stopped.
+                already_stopped = result == -1 and not was_active
+                if result != 0 and not already_stopped:
                     raise MotionError(f"StopMove returned {result!r}")
             except Exception as exc:
                 errors.append(f"StopMove: {exc}")
@@ -325,16 +408,44 @@ class UnitreeMotionAdapter:
         if task is not None and not task.done() and task is not asyncio.current_task():
             task.cancel()
 
-    async def _success(self, method: Any, *args: Any) -> None:
-        result = await self._call(method, *args)
+    async def _success(
+        self,
+        method: Any,
+        *args: Any,
+        timeout_s: float | None = None,
+    ) -> None:
+        result = await self._call(method, *args, timeout_s=timeout_s)
         if result != 0:
             raise MotionError(f"{method.__name__} returned {result!r}")
 
-    async def _call(self, method: Any, *args: Any) -> Any:
+    async def _idle_stop(self) -> None:
+        """Apply an idempotent brake when no motion lease exists.
+
+        Woof's Sport service returns ``-1`` when StopMove is repeated while
+        already idle. This helper is deliberately restricted to call sites
+        that hold the adapter lock and have confirmed there is no active lease.
+        Active-motion emergency stops retain their stricter result handling.
+        """
+
+        if self._lease is not None or self._mode is not None:
+            raise MotionError("idle StopMove requested while motion is active")
+        result = await self._call_stop(self.sport.StopMove)
+        if result not in (0, -1):
+            raise MotionError(f"StopMove returned {result!r}")
+
+    async def _call(
+        self,
+        method: Any,
+        *args: Any,
+        timeout_s: float | None = None,
+    ) -> Any:
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(self._rpc_executor, method, *args)
         try:
-            return await asyncio.wait_for(asyncio.shield(future), self.config.rpc_timeout_s)
+            return await asyncio.wait_for(
+                asyncio.shield(future),
+                self.config.rpc_timeout_s if timeout_s is None else timeout_s,
+            )
         except asyncio.TimeoutError as exc:
             raise MotionNotReady(f"{method.__name__} timed out") from exc
 

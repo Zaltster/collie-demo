@@ -19,7 +19,7 @@ def test_one_click_follow_is_owned_by_robot_service() -> None:
     assert "keepalive:true" in html
 
 
-def test_each_detection_gets_an_exact_select_control() -> None:
+def test_each_detection_gets_a_select_control() -> None:
     html = (Path(__file__).parents[1] / "web" / "index.html").read_text()
 
     assert "for(const [index,item] of state.detections.entries())" in html
@@ -32,12 +32,16 @@ def test_each_detection_gets_an_exact_select_control() -> None:
     assert "SpeechRecognition" not in html
 
 
-def test_camera_refresh_does_not_cancel_an_inflight_image() -> None:
+def test_camera_uses_one_low_latency_stream_with_browser_overlay() -> None:
     html = (Path(__file__).parents[1] / "web" / "index.html").read_text()
 
     assert "if(refreshInFlight)return" in html
-    assert "if(camera.complete)camera.src=" in html
     assert "finally{refreshInFlight=false}" in html
+    assert 'src="/camera-stream.mjpg"' in html
+    assert 'id="camera-overlay"' in html
+    assert "renderOverlay(s)" in html
+    assert "s.camera_fps" in html
+    assert "camera.jpg?t=${Date.now()}" not in html
 
 
 def test_tracker_confidence_is_not_presented_as_live_yolo_confidence() -> None:
@@ -66,12 +70,30 @@ def test_stage_health_is_visible_in_the_ui() -> None:
 def test_memory_demo_ui_keeps_stop_and_manual_fallback() -> None:
     html = (Path(__file__).parents[1] / "web" / "index.html").read_text()
 
-    assert "SAVE FRUIT" in html
+    assert "SAVE CLASS" in html
     assert "RUN REMEMBER & FIND" in html
     assert "direct yaw" in html
-    assert "await api('/api/memory/capture',{target:name,center})" in html
+    assert "await api('/api/memory/capture',{target:name,center,round_id:roundId})" in html
     assert "await api('/api/demo/start',{confirmation:'TARGET SAVED AND AREA CLEAR'})" in html
-    assert "await remove('/api/memory')" in html
+    assert "await api('/api/demo/go',{confirmation:'CLASS LOCKED AND PATH CLEAR'})" in html
+    assert 'id="go" disabled' in html
+    assert "go.onclick=approveGo" in html
+    assert "WAITING FOR CLASS" in html
+    assert "GO TO FRUIT" in html
+    assert "await api('/api/round/reset')" in html
+    assert "START OVER (FULL RESET)" in html
+    assert "uiRoundGeneration+=1" in html
     assert "Manual follower fallback" in html
+    assert "FIND THIS ${saved.label.toUpperCase()} & RETURN" in html
+    assert "return_home_status" in html
+    assert "search_progress_deg" in html
+    assert "search_sweep_deg" in html
+    assert "detector_confidence" in html
+    assert "No saved-class detection yet" in html
+    assert "exact physical prop" not in html
+    assert "exact instance" not in html
+    assert "Candidate similarity" not in html
+    assert "FIND A DIFFERENT" not in html
+    assert "Fruit to reject" not in html
     assert 'id="stop"' in html
     assert "following||demoActive||startingFollow||startingDemo" in html

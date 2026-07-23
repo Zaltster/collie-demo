@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -66,11 +67,18 @@ def test_fruit_detector_returns_label_confidence_box_and_center(tmp_path: Path) 
     model_path.write_bytes(b"test")
     model = FakeModel()
     detector = FruitDetector(
-        model_path, confidence=0.5, device="cuda:0", model=model
+        model_path,
+        confidence=0.5,
+        device="cuda:0",
+        task="segment",
+        model=model,
     )
     frame = np.zeros((100, 100, 3), dtype=np.uint8)
 
     detections = detector.detect(frame)
+    model.predictor = SimpleNamespace(
+        model=SimpleNamespace(device="cuda:0")
+    )
 
     assert len(detections) == 1
     detection = detections[0]
@@ -80,6 +88,8 @@ def test_fruit_detector_returns_label_confidence_box_and_center(tmp_path: Path) 
     assert detection.center == (30, 50)
     assert model.last_predict_options["device"] == "cuda:0"
     assert detector.device_status()["requested"] == "cuda:0"
+    assert detector.device_status()["task"] == "segment"
+    assert detector.device_status()["resolved"] == "cuda:0"
     assert np.any(annotate_fruits(frame, detections) != frame)
 
 
