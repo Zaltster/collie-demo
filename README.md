@@ -99,13 +99,29 @@ or internet connection is used at runtime.
   `COLLIE_MATCH_STRETCH_ENABLED=0` to skip the gesture;
   `COLLIE_MATCH_STRETCH_SETTLE_S` and `COLLIE_MATCH_REACQUIRE_TIMEOUT_S` control
   the animation wait and fresh-frame reacquisition window.
-- After the fruit has reached the lower camera region and then disappears, Woof
-  first releases every locomotion owner and stops. It then performs the stock
-  `Hello` paw-forward gesture as a visible arrival acknowledgement before
-  return-home begins. Early target loss never triggers this gesture. The action
-  is cosmetic and nonfatal: an SDK rejection is reported in mission telemetry,
-  but Woof remains stopped and continues through the safe return path. Set
-  `COLLIE_ARRIVAL_HELLO_ENABLED=0` to disable it; use
+- A fruit is considered close only after several fresh frames put its bottom
+  and center in the lower camera region **and** its box is large enough. The
+  size check prevents a distant fruit that merely sits low in the image from
+  authorizing blind motion. Tune `COLLIE_NEAR_BOTTOM_RATIO`,
+  `COLLIE_NEAR_CENTER_RATIO`, `COLLIE_NEAR_BBOX_HEIGHT_RATIO`, and
+  `COLLIE_NEAR_CONFIRMATIONS`; the production defaults are `0.86`, `0.72`,
+  `0.15`, and `3`. `COLLIE_NEAR_LOSS_GRACE_S=0.75` additionally requires the
+  disappearance to happen immediately after that close evidence; a fruit that
+  moved away before being lost cannot trigger the final approach.
+- After a verified-close fruit disappears below the camera, Woof first releases
+  the visual follower and stops. It then makes one straight, low-speed,
+  watchdog-bounded final approach through the factory obstacle-avoidance path.
+  `COLLIE_FINAL_APPROACH_DURATION_S` and `COLLIE_FINAL_APPROACH_MPS` set the
+  calibration. The production starting point is deliberately conservative:
+  `0.5 s` at `0.10 m/s`, or at most `0.05 m` of commanded travel. Status reports
+  the elapsed time and commanded speed-times-time distance; that number is not
+  measured odometry. Arbitrary or early target loss still stops immediately and
+  never enters this stage.
+- Once the bounded final approach has stopped, Woof performs the stock `Hello`
+  paw-forward gesture as a visible arrival acknowledgement before return-home
+  begins. The action is cosmetic and nonfatal: an SDK rejection is reported in
+  mission telemetry, but Woof remains stopped and continues through the safe
+  return path. Set `COLLIE_ARRIVAL_HELLO_ENABLED=0` to disable it; use
   `COLLIE_ARRIVAL_HELLO_SETTLE_S` to control the stopped settling delay.
 - Keeps persistent fruit memory separate from the ephemeral visual track. A
   normal target-loss stop therefore cannot erase what Woof was shown before it

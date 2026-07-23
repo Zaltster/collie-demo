@@ -22,7 +22,7 @@ from collie_demo.runtime import (
     CollieRuntime,
     RuntimeCommandError,
 )
-from collie_demo.types import CameraFrame
+from collie_demo.types import CameraFrame, TargetObservation
 
 from test_motion import FakeAvoidance, FakeSport
 
@@ -413,6 +413,150 @@ def test_navigation_lease_expires_to_hardware_stop() -> None:
             status = await runtime.navigation_status()
             assert status["armed"] is False
             assert sport.stop_calls >= 1
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_close_range_gate_rejects_a_small_fruit_low_in_the_image() -> None:
+    runtime = CollieRuntime(
+        camera=StaticFruitCamera(),
+        controller=ApproachController(),
+        motion=None,
+        motion_enabled=False,
+        allow_unranged_forward=True,
+        mission_config=MissionConfig(
+            near_bottom_ratio=0.86,
+            near_center_ratio=0.72,
+            near_bbox_height_ratio=0.15,
+        ),
+    )
+    small_low_pear = TargetObservation(
+        frame_id=1,
+        captured_monotonic_s=time.monotonic(),
+        bbox_xywh=(1156, 852, 76, 96),
+        center=(1194, 900),
+        confidence=0.95,
+        visible_frames=8,
+    )
+    near, height_ratio = runtime._near_target_geometry(
+        small_low_pear, 1080
+    )
+
+    assert near is False
+    assert height_ratio is not None
+    assert round(height_ratio, 3) == 0.089
+
+
+def test_close_range_gate_accepts_a_large_fruit_at_the_camera_edge() -> None:
+    runtime = CollieRuntime(
+        camera=StaticFruitCamera(),
+        controller=ApproachController(),
+        motion=None,
+        motion_enabled=False,
+        allow_unranged_forward=True,
+        mission_config=MissionConfig(
+            near_bottom_ratio=0.86,
+            near_center_ratio=0.72,
+            near_bbox_height_ratio=0.15,
+        ),
+    )
+    large_low_fruit = TargetObservation(
+        frame_id=1,
+        captured_monotonic_s=time.monotonic(),
+        bbox_xywh=(760, 850, 210, 200),
+        center=(865, 950),
+        confidence=0.93,
+        visible_frames=8,
+    )
+
+    near, height_ratio = runtime._near_target_geometry(
+        large_low_fruit, 1080
+    )
+
+    assert near is True
+    assert height_ratio is not None
+    assert round(height_ratio, 3) == 0.185
+
+
+def test_final_approach_is_short_straight_and_watchdog_bounded() -> None:
+    async def scenario() -> None:
+        sport, avoidance = FakeSport(), FakeAvoidance()
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(),
+            motion=UnitreeMotionAdapter(sport, avoidance),
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            loop_hz=60.0,
+            navigation_command_lease_s=0.10,
+            mission_config=MissionConfig(
+                final_approach_duration_s=0.08,
+                final_approach_mps=0.04,
+            ),
+        )
+        await runtime.start()
+        try:
+            for _ in range(100):
+                if (await runtime.status())["health"]["camera_live"]:
+                    break
+                await asyncio.sleep(0.01)
+            reason = await runtime._run_final_approach(
+                "target_class_reached_camera_edge"
+            )
+            status = await runtime.status()
+
+            assert reason == "bounded_final_approach_complete"
+            assert status["mission"]["phase"] == "final_approaching"
+            assert status["mission"]["final_approach_status"] == "complete"
+            assert (
+                0.06
+                <= status["mission"]["final_approach_elapsed_s"]
+                <= 0.08
+            )
+            assert (
+                0.002
+                <= status["mission"][
+                    "final_approach_commanded_distance_m"
+                ]
+                <= 0.004
+            )
+            assert any(move[0] == 0.04 for move in avoidance.moves)
+            assert all(move[1] == 0.0 and move[2] == 0.0 for move in avoidance.moves)
+            assert avoidance.moves[-1] == (0.0, 0.0, 0.0)
+            assert status["armed"] is False
+        finally:
+            await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_final_approach_does_not_run_for_early_target_loss() -> None:
+    async def scenario() -> None:
+        avoidance = FakeAvoidance()
+        runtime = CollieRuntime(
+            camera=StaticFruitCamera(),
+            controller=ApproachController(),
+            motion=UnitreeMotionAdapter(FakeSport(), avoidance),
+            motion_enabled=True,
+            allow_unranged_forward=True,
+            mission_config=MissionConfig(
+                final_approach_duration_s=0.08,
+                final_approach_mps=0.04,
+            ),
+        )
+        await runtime.start()
+        try:
+            reason = await runtime._run_final_approach(
+                "saved fruit class lost before arrival"
+            )
+            status = await runtime.status()
+
+            assert reason == "saved fruit class lost before arrival"
+            assert status["mission"]["final_approach_status"] == "not_triggered"
+            assert avoidance.moves == []
+            assert status["armed"] is False
         finally:
             await runtime.close()
 
