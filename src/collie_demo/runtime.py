@@ -1111,6 +1111,24 @@ class CollieRuntime:
                         math.degrees(self.mission_config.search_sweep_rad), 1
                     ),
                     "search_timeout_s": self.mission_config.search_timeout_s,
+                    "near_bottom_ratio": self.mission_config.near_bottom_ratio,
+                    "near_center_ratio": self.mission_config.near_center_ratio,
+                    "near_bbox_height_ratio": (
+                        self.mission_config.near_bbox_height_ratio
+                    ),
+                    "near_confirmations_required": (
+                        self.mission_config.near_confirmations_required
+                    ),
+                    "near_loss_grace_s": self.mission_config.near_loss_grace_s,
+                    "final_approach_duration_s": (
+                        self.mission_config.final_approach_duration_s
+                    ),
+                    "final_approach_mps": self.mission_config.final_approach_mps,
+                    "final_approach_commanded_distance_limit_m": round(
+                        self.mission_config.final_approach_duration_s
+                        * self.mission_config.final_approach_mps,
+                        3,
+                    ),
                     "active": mission_active,
                     "return_home_enabled": self.mission_config.return_home_enabled,
                     "return_arrival_tolerance_m": (
@@ -1540,6 +1558,8 @@ class CollieRuntime:
             match = await self._wait_for_demo_go(match)
             await self._start_memory_approach(match)
             approach_reason = await self._monitor_memory_approach()
+            await self.stop("demo_visual_approach_complete")
+            approach_reason = await self._run_final_approach(approach_reason)
             await self.stop("demo_target_reached")
             await self._celebrate_target_reached()
             if self.mission_config.return_home_enabled:
@@ -1993,6 +2013,29 @@ class CollieRuntime:
             self._mission.reason = "approaching_saved_fruit_class"
             self._mission.match_failures = 0
 
+    def _near_target_geometry(
+        self,
+        target: TargetObservation | None,
+        frame_height: int | None,
+    ) -> tuple[bool, float | None]:
+        """Return close-range image evidence and the observed box-height ratio."""
+
+        if target is None or frame_height is None or frame_height < 1:
+            return False, None
+        _x, y, _width, height = target.bbox_xywh
+        bottom_ratio = (y + height) / frame_height
+        center_ratio = target.center[1] / frame_height
+        bbox_height_ratio = height / frame_height
+        return (
+            bool(
+                bottom_ratio >= self.mission_config.near_bottom_ratio
+                and center_ratio >= self.mission_config.near_center_ratio
+                and bbox_height_ratio
+                >= self.mission_config.near_bbox_height_ratio
+            ),
+            bbox_height_ratio,
+        )
+
     async def _monitor_memory_approach(self) -> str:
         deadline = (
             time.monotonic()
@@ -2002,6 +2045,8 @@ class CollieRuntime:
         last_frame_id: int | None = None
         failures = 0
         near_target_seen = False
+        near_confirmations = 0
+        last_near_at: float | None = None
         while time.monotonic() < deadline:
             async with self._state_lock:
                 memory = self._fruit_memory
@@ -2022,20 +2067,33 @@ class CollieRuntime:
                 command_reason = self._command.reason
             if memory is None:
                 raise RuntimeCommandError("saved fruit memory disappeared")
-            if target is not None and frame_height:
-                x, y, width, height = target.bbox_xywh
-                bottom_ratio = (y + height) / frame_height
-                center_ratio = target.center[1] / frame_height
-                if (
-                    bottom_ratio >= self.mission_config.near_bottom_ratio
-                    and center_ratio >= self.mission_config.near_center_ratio
-                ):
-                    near_target_seen = True
-                    async with self._state_lock:
-                        self._mission.near_target_seen = True
-
             if frame is not None and frame_id is not None and frame_id != last_frame_id:
                 last_frame_id = frame_id
+                bbox_height_ratio: float | None = None
+                near_in_frame, bbox_height_ratio = self._near_target_geometry(
+                    target, frame_height
+                )
+                near_confirmations = (
+                    near_confirmations + 1 if near_in_frame else 0
+                )
+                if (
+                    near_confirmations
+                    >= self.mission_config.near_confirmations_required
+                ):
+                    near_target_seen = True
+                    last_near_at = time.monotonic()
+                near_target_recent = bool(
+                    last_near_at is not None
+                    and time.monotonic() - last_near_at
+                    <= self.mission_config.near_loss_grace_s
+                )
+                async with self._state_lock:
+                    self._mission.near_target_seen = near_target_seen
+                    self._mission.near_target_recent = near_target_recent
+                    self._mission.near_target_confirmations = near_confirmations
+                    self._mission.near_target_bbox_height_ratio = (
+                        bbox_height_ratio
+                    )
                 result = self.class_matcher.match(
                     memory,
                     detections,
@@ -2052,27 +2110,123 @@ class CollieRuntime:
                 async with self._state_lock:
                     self._mission.last_match = result.to_dict()
                     self._mission.match_failures = failures
-                if near_target_seen and result.best is None:
+                if near_target_recent and result.best is None:
                     return "target_class_reached_camera_edge"
                 if failures >= self.mission_config.approach_misses_allowed:
                     raise RuntimeCommandError("saved fruit class lost during approach")
 
             if selected_name is None:
-                if near_target_seen:
+                near_target_recent = bool(
+                    last_near_at is not None
+                    and time.monotonic() - last_near_at
+                    <= self.mission_config.near_loss_grace_s
+                )
+                if near_target_recent:
                     return "target_class_reached_camera_edge"
                 raise RuntimeCommandError("saved fruit class lost before arrival")
             if not follow_active:
-                if near_target_seen and command_reason in {
+                near_target_recent = bool(
+                    last_near_at is not None
+                    and time.monotonic() - last_near_at
+                    <= self.mission_config.near_loss_grace_s
+                )
+                if near_target_recent and command_reason in {
                     "selected_target_not_revalidated",
                     "selected_target_lost",
-                    "forward_budget_complete",
                 }:
                     return "target_class_reached_camera_edge"
+                if (
+                    near_target_recent
+                    and command_reason == "forward_budget_complete"
+                ):
+                    return "target_visible_near_forward_budget_complete"
                 raise RuntimeCommandError(f"approach stopped: {command_reason}")
             if frame_width is None:
                 raise RuntimeCommandError("camera geometry unavailable during approach")
             await asyncio.sleep(0.025)
         raise RuntimeCommandError("saved fruit approach timed out")
+
+    async def _run_final_approach(self, approach_reason: str) -> str:
+        """Advance briefly after a verified close fruit drops below the camera.
+
+        This stage starts only after the visual follower has stopped and
+        released its lease. It drives straight through the factory obstacle
+        avoidance path, renews a short watchdog lease, and remains bounded by
+        both duration and speed. The reported distance is commanded
+        speed-times-time, not a claim of measured displacement.
+        """
+
+        if approach_reason != "target_class_reached_camera_edge":
+            async with self._state_lock:
+                self._mission.final_approach_status = "not_triggered"
+            return approach_reason
+        duration_s = self.mission_config.final_approach_duration_s
+        forward_mps = self.mission_config.final_approach_mps
+        if duration_s <= 0.0:
+            async with self._state_lock:
+                self._mission.final_approach_status = "disabled"
+            return approach_reason
+
+        async with self._state_lock:
+            self._mission.phase = MissionPhase.FINAL_APPROACHING
+            self._mission.reason = "bounded_final_approach_after_camera_edge"
+            self._mission.final_approach_status = "running"
+            self._mission.final_approach_elapsed_s = 0.0
+            self._mission.final_approach_commanded_distance_m = 0.0
+        print(
+            "final_approach event=start "
+            f"duration_s={duration_s:.3f} "
+            f"forward_mps={forward_mps:.3f} "
+            f"commanded_distance_limit_m={duration_s * forward_mps:.3f}",
+            flush=True,
+        )
+
+        started_at = time.monotonic()
+        deadline = started_at + duration_s
+        try:
+            await self.navigation_arm(NAVIGATION_ARM_CONFIRMATION)
+            while time.monotonic() < deadline:
+                now = time.monotonic()
+                async with self._state_lock:
+                    camera_age_s = (
+                        None
+                        if self._last_frame_at is None
+                        else now - self._last_frame_at
+                    )
+                if camera_age_s is None or camera_age_s >= 1.0:
+                    raise RuntimeCommandError(
+                        "camera became stale during final approach"
+                    )
+                await self.navigation_command(forward_mps, 0.0)
+                elapsed_s = min(duration_s, time.monotonic() - started_at)
+                async with self._state_lock:
+                    self._mission.final_approach_elapsed_s = elapsed_s
+                    self._mission.final_approach_commanded_distance_m = (
+                        forward_mps * elapsed_s
+                    )
+                await asyncio.sleep(
+                    min(0.05, max(0.0, deadline - time.monotonic()))
+                )
+            await self.stop("final_approach_complete")
+        except Exception:
+            async with self._state_lock:
+                self._mission.final_approach_status = "failed"
+            raise
+
+        elapsed_s = min(duration_s, time.monotonic() - started_at)
+        async with self._state_lock:
+            self._mission.final_approach_status = "complete"
+            self._mission.final_approach_elapsed_s = elapsed_s
+            self._mission.final_approach_commanded_distance_m = (
+                forward_mps * elapsed_s
+            )
+        print(
+            "final_approach event=complete "
+            f"elapsed_s={elapsed_s:.3f} "
+            f"commanded_distance_m={forward_mps * elapsed_s:.3f}",
+            flush=True,
+        )
+        return "bounded_final_approach_complete"
 
     async def _return_home(self) -> None:
         """Return to the captured start pose using fresh local odometry.
