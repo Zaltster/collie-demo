@@ -31,6 +31,12 @@ class NavigationCommandRequest(BaseModel):
     yaw_rps: float
 
 
+class FinalApproachCalibrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    duration_s: float
+    forward_mps: float
+
+
 def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -156,6 +162,18 @@ def create_app(runtime: CollieRuntime, web_directory: Path) -> FastAPI:
     async def approve_demo_go(request: ArmRequest) -> dict[str, object]:
         try:
             return await runtime.approve_demo_go(request.confirmation)
+        except RuntimeCommandError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/calibration/final-approach")
+    async def configure_final_approach(
+        request: FinalApproachCalibrationRequest,
+    ) -> dict[str, object]:
+        try:
+            return await runtime.configure_final_approach(
+                request.duration_s,
+                request.forward_mps,
+            )
         except RuntimeCommandError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
