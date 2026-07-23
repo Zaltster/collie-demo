@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from dataclasses import replace
 import math
 from pathlib import Path
 import time
@@ -25,10 +24,6 @@ ARM_CONFIRMATION = "TARGET AND PATH CLEAR"
 NAVIGATION_ARM_CONFIRMATION = "MAP AND PATH CLEAR"
 DEMO_CONFIRMATION = "TARGET SAVED AND AREA CLEAR"
 DEMO_GO_CONFIRMATION = "CLASS LOCKED AND PATH CLEAR"
-FINAL_APPROACH_MIN_MPS = 0.05
-FINAL_APPROACH_MAX_MPS = 0.15
-FINAL_APPROACH_MAX_DURATION_S = 3.0
-FINAL_APPROACH_MAX_COMMAND_DISTANCE_M = 0.30
 
 
 class CameraProtocol(Protocol):
@@ -444,73 +439,6 @@ class CollieRuntime:
             "command": self._command.to_dict(),
             "limits": None if motion_status is None else motion_status["limits"],
         }
-
-    async def configure_final_approach(
-        self,
-        duration_s: float,
-        forward_mps: float,
-    ) -> dict[str, object]:
-        """Update the session calibration only while every motion owner is idle."""
-
-        duration_s = float(duration_s)
-        forward_mps = float(forward_mps)
-        if not math.isfinite(duration_s) or not 0.0 <= duration_s <= (
-            FINAL_APPROACH_MAX_DURATION_S
-        ):
-            raise RuntimeCommandError(
-                "final approach duration must be between 0 and "
-                f"{FINAL_APPROACH_MAX_DURATION_S:.1f} seconds"
-            )
-        if not math.isfinite(forward_mps) or not (
-            FINAL_APPROACH_MIN_MPS
-            <= forward_mps
-            <= FINAL_APPROACH_MAX_MPS
-        ):
-            raise RuntimeCommandError(
-                "final approach speed must be between "
-                f"{FINAL_APPROACH_MIN_MPS:.2f} and "
-                f"{FINAL_APPROACH_MAX_MPS:.2f} m/s"
-            )
-        commanded_distance_m = duration_s * forward_mps
-        if commanded_distance_m > FINAL_APPROACH_MAX_COMMAND_DISTANCE_M:
-            raise RuntimeCommandError(
-                "final approach commanded distance must not exceed "
-                f"{FINAL_APPROACH_MAX_COMMAND_DISTANCE_M:.2f} m"
-            )
-
-        async with self._action_lock:
-            mission_active = bool(
-                self._mission_task is not None
-                and not self._mission_task.done()
-            )
-            if (
-                mission_active
-                or self._lease is not None
-                or (self.motion is not None and self.motion.armed)
-            ):
-                raise RuntimeCommandError(
-                    "stop the mission and all motion before changing calibration"
-                )
-            if (
-                self.motion is not None
-                and forward_mps > self.motion.config.maximum_forward_mps
-            ):
-                raise RuntimeCommandError(
-                    "final approach speed exceeds the deployed motion limit"
-                )
-            self.mission_config = replace(
-                self.mission_config,
-                final_approach_duration_s=duration_s,
-                final_approach_mps=forward_mps,
-            )
-        print(
-            "final_approach event=calibration_updated "
-            f"duration_s={duration_s:.3f} "
-            f"forward_mps={forward_mps:.3f} "
-            f"commanded_distance_limit_m={commanded_distance_m:.3f}",
-            flush=True,
-        )
-        return await self.status()
 
     async def start_follow(self, confirmation: str) -> dict[str, object]:
         generation = self._follow_start_generation
@@ -1201,14 +1129,6 @@ class CollieRuntime:
                         * self.mission_config.final_approach_mps,
                         3,
                     ),
-                    "final_approach_limits": {
-                        "minimum_mps": FINAL_APPROACH_MIN_MPS,
-                        "maximum_mps": FINAL_APPROACH_MAX_MPS,
-                        "maximum_duration_s": FINAL_APPROACH_MAX_DURATION_S,
-                        "maximum_commanded_distance_m": (
-                            FINAL_APPROACH_MAX_COMMAND_DISTANCE_M
-                        ),
-                    },
                     "active": mission_active,
                     "return_home_enabled": self.mission_config.return_home_enabled,
                     "return_arrival_tolerance_m": (

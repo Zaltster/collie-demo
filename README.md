@@ -117,12 +117,6 @@ or internet connection is used at runtime.
   the elapsed time and commanded speed-times-time distance; that number is not
   measured odometry. Arbitrary or early target loss still stops immediately and
   never enters this stage.
-- The UI calibration panel can change the final duration and speed while Woof is
-  fully stopped. The API rejects changes during a mission or while any motion
-  lease is armed, caps duration at `3.0 s`, speed at `0.15 m/s`, and commanded
-  travel at `0.30 m`, and never moves the robot when settings are applied. These
-  are session settings; copy the accepted calibration into the deployment
-  environment after the physical trial if it should survive a service restart.
 - Once the bounded final approach has stopped, Woof performs the stock `Hello`
   paw-forward gesture as a visible arrival acknowledgement before return-home
   begins. The action is cosmetic and nonfatal: an SDK rejection is reported in

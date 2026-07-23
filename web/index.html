@@ -17,9 +17,6 @@
     .actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.choose,.save{padding:9px 12px;white-space:nowrap}.save{background:#126548}.choose.selected{outline:3px solid #55f09a;background:#226e51}
     #reference{display:none;width:150px;max-height:130px;object-fit:contain;border:1px solid #458772;border-radius:10px;background:#000;margin-top:8px}
     #mission-phase{text-transform:uppercase;font-size:1.12rem;font-weight:800}.button-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
-    .calibration-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0}.metric{border:1px solid #285a49;border-radius:12px;padding:10px;background:#081a15}.metric span{display:block;color:#9cbcaf;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em}.metric strong{display:block;margin-top:4px;font-size:1.05rem}
-    .field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:12px}label{color:#b8d3c8;font-size:.86rem;font-weight:700}input{box-sizing:border-box;width:100%;margin-top:6px;padding:10px;border:1px solid #458772;border-radius:10px;background:#06120f;color:#effff9;font:inherit;font-weight:800}input:focus{outline:3px solid #287f5c}
-    .preset-row{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}.preset{padding:7px 10px;background:#10372b}.calibration-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}#apply-calibration{background:#186a4b}.calibration-note{border-left:3px solid #55f09a;padding-left:10px}
     details{margin-top:12px}summary{cursor:pointer;font-weight:800}code{overflow-wrap:anywhere}
   </style>
 </head>
@@ -57,31 +54,6 @@
       <button id="go" disabled>WAITING FOR CLASS</button>
       <div class="button-row"><button id="stop">STOP NOW</button></div>
     </section>
-    <section class="panel">
-      <b>3. Calibrate the camera-edge finish</b>
-      <p class="muted calibration-note">Changing these values does not move Woof. They apply only after a verified-close fruit disappears below the camera during a Go-approved mission.</p>
-      <div class="calibration-grid">
-        <div class="metric"><span>Fruit size gate</span><strong id="near-size">Waiting for fruit</strong></div>
-        <div class="metric"><span>Close confirmations</span><strong id="near-confirmations">0 / 3</strong></div>
-        <div class="metric"><span>Final pulse</span><strong id="final-pulse">0.50 s</strong></div>
-        <div class="metric"><span>Commanded maximum</span><strong id="final-distance">5 cm</strong></div>
-      </div>
-      <div class="field-grid">
-        <label>Duration (seconds)<input id="calibration-duration" type="number" min="0" max="3" step="0.25" inputmode="decimal"></label>
-        <label>Speed (m/s)<input id="calibration-speed" type="number" min="0.05" max="0.15" step="0.01" inputmode="decimal"></label>
-      </div>
-      <div class="preset-row" aria-label="Duration presets">
-        <button class="preset" type="button" data-duration="0.5">0.5 s</button>
-        <button class="preset" type="button" data-duration="1">1.0 s</button>
-        <button class="preset" type="button" data-duration="1.5">1.5 s</button>
-        <button class="preset" type="button" data-duration="2">2.0 s</button>
-      </div>
-      <div class="calibration-actions">
-        <button id="apply-calibration" type="button">APPLY CALIBRATION</button>
-        <span id="calibration-feedback" class="muted">Session setting · start at 0.5 seconds.</span>
-      </div>
-      <p id="final-status" class="muted">Final approach has not run this round.</p>
-    </section>
   </div>
   <details>
     <summary>Manual follower fallback</summary>
@@ -92,8 +64,8 @@
     <p><button id="follow" disabled>FOLLOW SELECTED FRUIT</button></p>
   </details>
   <script>
-    const live=document.querySelector('#live'),camera=document.querySelector('#camera'),cameraOverlay=document.querySelector('#camera-overlay'),target=document.querySelector('#target'),command=document.querySelector('#command'),monitor=document.querySelector('#monitor'),produce=document.querySelector('#produce'),produceMeta=document.querySelector('#produce-meta'),targetFeedback=document.querySelector('#target-feedback'),follow=document.querySelector('#follow'),stop=document.querySelector('#stop'),run=document.querySelector('#run'),go=document.querySelector('#go'),reset=document.querySelector('#reset'),reload=document.querySelector('#reload'),memoryView=document.querySelector('#memory'),reference=document.querySelector('#reference'),missionPhase=document.querySelector('#mission-phase'),missionView=document.querySelector('#mission'),matchView=document.querySelector('#match'),nearSize=document.querySelector('#near-size'),nearConfirmations=document.querySelector('#near-confirmations'),finalPulse=document.querySelector('#final-pulse'),finalDistance=document.querySelector('#final-distance'),calibrationDuration=document.querySelector('#calibration-duration'),calibrationSpeed=document.querySelector('#calibration-speed'),applyCalibration=document.querySelector('#apply-calibration'),calibrationFeedback=document.querySelector('#calibration-feedback'),finalStatus=document.querySelector('#final-status');
-    let following=false,demoActive=false,startingFollow=false,startingDemo=false,sendingGo=false,capturing=false,resetting=false,refreshInFlight=false,savingCalibration=false,calibrationDirty=false,stopPromise=null,memoryId=null,roundId=null,uiRoundGeneration=0;
+    const live=document.querySelector('#live'),camera=document.querySelector('#camera'),cameraOverlay=document.querySelector('#camera-overlay'),target=document.querySelector('#target'),command=document.querySelector('#command'),monitor=document.querySelector('#monitor'),produce=document.querySelector('#produce'),produceMeta=document.querySelector('#produce-meta'),targetFeedback=document.querySelector('#target-feedback'),follow=document.querySelector('#follow'),stop=document.querySelector('#stop'),run=document.querySelector('#run'),go=document.querySelector('#go'),reset=document.querySelector('#reset'),reload=document.querySelector('#reload'),memoryView=document.querySelector('#memory'),reference=document.querySelector('#reference'),missionPhase=document.querySelector('#mission-phase'),missionView=document.querySelector('#mission'),matchView=document.querySelector('#match');
+    let following=false,demoActive=false,startingFollow=false,startingDemo=false,sendingGo=false,capturing=false,resetting=false,refreshInFlight=false,stopPromise=null,memoryId=null,roundId=null,uiRoundGeneration=0;
     async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok){const e=await r.json();throw new Error(e.detail||r.statusText)}return r.json()}
     async function remove(path){const r=await fetch(path,{method:'DELETE'});if(!r.ok){const e=await r.json();throw new Error(e.detail||r.statusText)}return r.json()}
     function closestSelectedIndex(detections,name,hint){
@@ -138,36 +110,13 @@
       else{memoryId=null;memoryView.textContent='No class saved';memoryView.className='bad';reference.removeAttribute('src');reference.style.display='none'}
       matchView.textContent=best?`${best.label} class locked · YOLO ${(best.detector_confidence*100).toFixed(1)}% · ${last.candidate_count} candidate${last.candidate_count===1?'':'s'}`:'No saved-class detection yet';
     }
-    function updateCalibrationPreview(){
-      const duration=Number(calibrationDuration.value),speed=Number(calibrationSpeed.value),distance=duration*speed;
-      finalPulse.textContent=Number.isFinite(duration)?`${duration.toFixed(2)} s`:'—';
-      finalDistance.textContent=Number.isFinite(distance)?`${Math.round(distance*100)} cm`:'—';
-    }
-    function renderCalibration(s){
-      const m=s.mission||{},frameHeight=s.frame_height||0,threshold=Number(m.near_bbox_height_ratio??0.15),detections=s.produce?.detections||[];
-      let observed=null;
-      for(const item of detections){const height=(item.bbox_xyxy?.[3]??0)-(item.bbox_xyxy?.[1]??0);if(!observed||height>observed.height)observed={item,height}}
-      if(observed&&frameHeight){
-        const item=observed.item,heightRatio=observed.height/frameHeight,bottomRatio=item.bbox_xyxy[3]/frameHeight,centerRatio=item.center[1]/frameHeight,passes=heightRatio>=threshold&&bottomRatio>=Number(m.near_bottom_ratio??0.86)&&centerRatio>=Number(m.near_center_ratio??0.72);
-        nearSize.textContent=`${(heightRatio*100).toFixed(1)}% / ${(threshold*100).toFixed(0)}% · ${passes?'CLOSE FRAME':'WAIT'}`;nearSize.className=passes?'good':'bad';
-      }else{nearSize.textContent='Waiting for fruit';nearSize.className=''}
-      nearConfirmations.textContent=`${m.near_target_confirmations??0} / ${m.near_confirmations_required??3}${m.near_target_recent?' · ARMED':''}`;nearConfirmations.className=m.near_target_recent?'good':'';
-      if(!calibrationDirty&&document.activeElement!==calibrationDuration&&document.activeElement!==calibrationSpeed){
-        calibrationDuration.value=Number(m.final_approach_duration_s??0.5).toFixed(2);
-        calibrationSpeed.value=Number(m.final_approach_mps??0.10).toFixed(2);
-      }
-      updateCalibrationPreview();
-      const status=(m.final_approach_status||'not_requested').replaceAll('_',' '),elapsed=Number(m.final_approach_elapsed_s??0),distance=Number(m.final_approach_commanded_distance_m??0);
-      finalStatus.textContent=`Final approach: ${status} · last pulse ${elapsed.toFixed(2)} s · commanded ${Math.round(distance*100)} cm`;
-      const blocked=Boolean(m.active||s.armed);applyCalibration.disabled=savingCalibration||blocked;applyCalibration.title=blocked?'Stop Woof before changing calibration':'This changes settings only; it does not move Woof.';
-    }
     async function refresh(){
       if(refreshInFlight)return;refreshInFlight=true;
       try{
         const s=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json()),selected=s.selected_target_name,selectedObservation=s.selected_target,failedHealth=Object.entries(s.health||{}).filter(([,ok])=>!ok).map(([name])=>name.replaceAll('_',' '));roundId=s.round_id||roundId;
         live.textContent=s.stage_ready?'STAGE READY':`NOT READY${failedHealth.length?`: ${failedHealth.join(', ')}`:''}`;live.className=`pill ${s.stage_ready?'good':'bad'}`;target.textContent=selected?`${selected} · ${seenLabel(selectedObservation)}`:'Choose a detected fruit';target.className=selectedObservation?'good':'bad';command.textContent=`${s.command.reason} · forward ${s.command.forward_mps.toFixed(2)} m/s · yaw ${s.command.yaw_rps.toFixed(2)} rad/s · ${s.forward_remaining_s.toFixed(1)}s remaining`;following=Boolean(s.follow_active);
         const tracker=s.produce?.tracker,misses=tracker?.revalidation_failures??0,required=tracker?.revalidation_failures_required??3,verified=tracker?.last_verified_age_s;monitor.textContent=`camera ${s.camera_fps??'—'} FPS / age ${s.frame_age_s??'—'}s · YOLO verified ${verified??'—'}s ago · misses ${misses}/${required} · motion ${s.motion?.fault||((s.health?.motion_ready)?'ready':'not ready')}`;
-        renderProduce(s.produce,selected,s.selected_target_hint);renderOverlay(s);renderMission(s);renderCalibration(s);updateFollowButton(Boolean(s.can_follow),s.follow_readiness||'');
+        renderProduce(s.produce,selected,s.selected_target_hint);renderOverlay(s);renderMission(s);updateFollowButton(Boolean(s.can_follow),s.follow_readiness||'');
       }catch(e){live.textContent='APP UNAVAILABLE';live.className='pill bad'}finally{refreshInFlight=false}
     }
     async function rememberFruit(name,center){if(capturing||!roundId)return;const requestGeneration=uiRoundGeneration;capturing=true;targetFeedback.textContent=`Saving class ${name}…`;try{const s=await api('/api/memory/capture',{target:name,center,round_id:roundId});if(requestGeneration!==uiRoundGeneration)return;const hello=s.mission?.initial_hello_status;if(hello==='complete')targetFeedback.textContent=`Class ${name} saved. Woof acknowledged it with a paw. Place a ${name} behind Woof.`;else if(hello==='failed')targetFeedback.textContent=`Class ${name} was saved, but the Hello gesture failed: ${s.mission?.initial_hello_error||'unknown SDK error'}`;else targetFeedback.textContent=`Class ${name} saved. Place a ${name} behind Woof.`}catch(e){if(requestGeneration===uiRoundGeneration)targetFeedback.textContent=e.message}finally{if(requestGeneration===uiRoundGeneration){capturing=false;await refresh()}}}
@@ -175,12 +124,10 @@
     async function stopMotion(){if(!stopPromise)stopPromise=api('/api/stop').catch(()=>{}).finally(()=>{stopPromise=null});return stopPromise}
     async function beginDemo(){if(startingDemo)return;startingDemo=true;try{await api('/api/demo/start',{confirmation:'TARGET SAVED AND AREA CLEAR'});targetFeedback.textContent='Demo active: Woof will turn and find the saved fruit, then wait for Go.'}catch(e){targetFeedback.textContent=e.message}finally{startingDemo=false;await refresh()}}
     async function approveGo(){if(sendingGo)return;sendingGo=true;go.disabled=true;try{await api('/api/demo/go',{confirmation:'CLASS LOCKED AND PATH CLEAR'});targetFeedback.textContent='Go accepted. Woof is rechecking the saved fruit class before approaching.'}catch(e){targetFeedback.textContent=e.message}finally{sendingGo=false;await refresh()}}
-    async function saveCalibration(){if(savingCalibration)return;const duration=Number(calibrationDuration.value),speed=Number(calibrationSpeed.value);if(!Number.isFinite(duration)||!Number.isFinite(speed)){calibrationFeedback.textContent='Enter a valid duration and speed.';return}savingCalibration=true;applyCalibration.disabled=true;calibrationFeedback.textContent='Saving session calibration…';try{const s=await api('/api/calibration/final-approach',{duration_s:duration,forward_mps:speed});calibrationDirty=false;const m=s.mission||{};calibrationFeedback.textContent=`Applied: ${Number(m.final_approach_duration_s).toFixed(2)} s at ${Number(m.final_approach_mps).toFixed(2)} m/s · ${Math.round(Number(m.final_approach_commanded_distance_limit_m)*100)} cm maximum.`}catch(e){calibrationFeedback.textContent=e.message}finally{savingCalibration=false;await refresh()}}
     async function beginFollow(){if(following||startingFollow)return;startingFollow=true;updateFollowButton(false,'starting');try{const s=await api('/api/follow',{confirmation:'TARGET AND PATH CLEAR'});following=Boolean(s.follow_active);targetFeedback.textContent='Robot-side follow is active. Press Stop Now to stop early.'}catch(e){if(startingFollow)targetFeedback.textContent=e.message}finally{startingFollow=false;await refresh()}}
     async function resetRound(){if(resetting)return;resetting=true;uiRoundGeneration+=1;following=false;demoActive=false;startingFollow=false;startingDemo=false;sendingGo=false;capturing=false;memoryId=null;roundId=null;reset.disabled=true;reset.textContent='STOPPING & RESETTING EVERYTHING…';targetFeedback.textContent='Stopping Woof and resetting the complete demo…';try{const s=await api('/api/round/reset');roundId=s.round_id||null;targetFeedback.textContent='New round ready. Show Woof a fruit and press Save Class.'}catch(e){targetFeedback.textContent=e.message}finally{resetting=false;reset.disabled=false;reset.textContent='START OVER (FULL RESET)';await refresh()}}
     function endFollow(){const shouldStop=following||demoActive||startingFollow||startingDemo||sendingGo;following=false;demoActive=false;startingFollow=false;startingDemo=false;sendingGo=false;if(shouldStop)fetch('/api/stop',{method:'POST',keepalive:true}).catch(()=>{})}
     async function emergencyStop(){following=false;demoActive=false;startingFollow=false;startingDemo=false;sendingGo=false;await stopMotion();targetFeedback.textContent='Stopped.';await refresh()}
-    calibrationDuration.oninput=()=>{calibrationDirty=true;updateCalibrationPreview()};calibrationSpeed.oninput=()=>{calibrationDirty=true;updateCalibrationPreview()};for(const preset of document.querySelectorAll('.preset'))preset.onclick=()=>{calibrationDuration.value=Number(preset.dataset.duration).toFixed(2);calibrationDirty=true;updateCalibrationPreview()};applyCalibration.onclick=saveCalibration;
     camera.onerror=()=>setTimeout(()=>{camera.src=`/camera-stream.mjpg?t=${Date.now()}`},500);follow.onclick=beginFollow;run.onclick=beginDemo;go.onclick=approveGo;reset.onclick=resetRound;reload.onclick=()=>window.location.reload();window.addEventListener('pagehide',endFollow);stop.onclick=emergencyStop;refresh();setInterval(refresh,250);
   </script>
 </body>

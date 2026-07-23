@@ -97,23 +97,3 @@ def test_memory_demo_ui_keeps_stop_and_manual_fallback() -> None:
     assert "Fruit to reject" not in html
     assert 'id="stop"' in html
     assert "following||demoActive||startingFollow||startingDemo" in html
-
-
-def test_final_approach_calibration_is_visible_but_does_not_move_robot() -> None:
-    html = (Path(__file__).parents[1] / "web" / "index.html").read_text()
-
-    assert "3. Calibrate the camera-edge finish" in html
-    assert 'id="calibration-duration"' in html
-    assert 'id="calibration-speed"' in html
-    assert 'id="apply-calibration"' in html
-    assert "Changing these values does not move Woof" in html
-    assert "verified-close fruit disappears below the camera" in html
-    assert "m.near_bbox_height_ratio" in html
-    assert "m.near_target_confirmations" in html
-    assert "m.final_approach_commanded_distance_m" in html
-    assert (
-        "await api('/api/calibration/final-approach',"
-        "{duration_s:duration,forward_mps:speed})"
-    ) in html
-    assert "applyCalibration.onclick=saveCalibration" in html
-    assert "await api('/api/navigation/cmd'" not in html

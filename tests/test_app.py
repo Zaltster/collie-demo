@@ -84,19 +84,6 @@ class FakeRuntime:
             "confirmation": confirmation,
         }
 
-    async def configure_final_approach(
-        self, duration_s: float, forward_mps: float
-    ) -> dict[str, object]:
-        return {
-            "mission": {
-                "final_approach_duration_s": duration_s,
-                "final_approach_mps": forward_mps,
-                "final_approach_commanded_distance_limit_m": (
-                    duration_s * forward_mps
-                ),
-            }
-        }
-
     async def navigation_status(self) -> dict[str, object]:
         return {"available": True, "armed": False}
 
@@ -205,23 +192,3 @@ def test_memory_and_demo_endpoints_are_local_and_explicit(tmp_path: Path) -> Non
         assert reset.status_code == 200
         assert reset.json()["round_id"] == "round-2"
         assert client.delete("/api/memory").json()["memory"] is None
-
-
-def test_final_approach_calibration_endpoint_only_changes_settings(
-    tmp_path: Path,
-) -> None:
-    (tmp_path / "index.html").write_text("ok")
-    runtime = FakeRuntime()
-
-    with TestClient(create_app(runtime, tmp_path)) as client:  # type: ignore[arg-type]
-        response = client.post(
-            "/api/calibration/final-approach",
-            json={"duration_s": 1.25, "forward_mps": 0.10},
-        )
-
-        assert response.status_code == 200
-        assert response.json()["mission"] == {
-            "final_approach_duration_s": 1.25,
-            "final_approach_mps": 0.10,
-            "final_approach_commanded_distance_limit_m": 0.125,
-        }
